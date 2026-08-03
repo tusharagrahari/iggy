@@ -840,12 +840,12 @@ impl MySqlSource {
     ) -> Result<ProcessedRow, Error> {
         let mut row_pk: Option<PkValue> = None;
         let mut max_offset: Option<String> = None;
-        let mut extracted_payload: Option<Vec<u8>> = None;
 
         // Payload column set: only extract it plus tracking/pk columns.
         // Avoids extract_column_value on every other column since the data map
         // built below would be discarded anyway.
         if !config.payload_col.is_empty() {
+            let mut extracted_payload: Option<Vec<u8>> = None;
             for (i, column) in row.columns().iter().enumerate() {
                 let name = column.name();
                 if name == config.payload_col {
@@ -859,55 +859,69 @@ impl MySqlSource {
                     row_pk = extract_pk_value(row, i)?;
                 }
             }
+
+            // Every extract_payload_column arm yields Ok for a NULL column, so None
+            // here means the column was absent. Falling back to the whole-row JSON
+            // would publish bytes contradicting the schema derived from payload_format.
+            let payload = extracted_payload.ok_or_else(|| {
+                Error::InvalidRecordValue(format!(
+                    "table '{}': payload_column '{}' not present in the result set",
+                    config.table, config.payload_col
+                ))
+            })?;
+
+            return Ok(build_processed_row(
+                config.table,
+                payload,
+                max_offset,
+                row_pk,
+            ));
         }
 
-        if extracted_payload.is_none() {
-            let mut data = serde_json::Map::new();
-            for (i, column) in row.columns().iter().enumerate() {
-                let name = column.name();
-                let column_name = if config.snake_case_columns {
-                    to_snake_case(name)
-                } else {
-                    name.to_string()
-                };
-                let value = extract_column_value(row, i)?;
-                if name == config.tracking_column {
-                    max_offset = value_as_string(&value);
-                }
-                if name == config.pk_column {
-                    row_pk = extract_pk_value(row, i)?;
-                }
-                data.insert(column_name, value);
-            }
-
-            extracted_payload = Some(if config.include_metadata {
-                let record = DatabaseRecord {
-                    table_name: config.table.to_string(),
-                    operation_type: "SELECT".to_string(),
-                    timestamp: Utc::now(),
-                    data: serde_json::Value::Object(data),
-                    old_data: None,
-                };
-                simd_json::to_vec(&record).map_err(|e| {
-                    Error::InvalidRecordValue(format!(
-                        "table '{}': failed to serialize row to JSON: {e}",
-                        config.table
-                    ))
-                })?
+        let mut data = serde_json::Map::new();
+        for (i, column) in row.columns().iter().enumerate() {
+            let name = column.name();
+            let column_name = if config.snake_case_columns {
+                to_snake_case(name)
             } else {
-                simd_json::to_vec(&data).map_err(|e| {
-                    Error::InvalidRecordValue(format!(
-                        "table '{}': failed to serialize row to JSON: {e}",
-                        config.table
-                    ))
-                })?
-            });
+                name.to_string()
+            };
+            let value = extract_column_value(row, i)?;
+            if name == config.tracking_column {
+                max_offset = value_as_string(&value);
+            }
+            if name == config.pk_column {
+                row_pk = extract_pk_value(row, i)?;
+            }
+            data.insert(column_name, value);
         }
 
-        // Both paths above always assign extracted_payload before reaching here.
+        let payload = if config.include_metadata {
+            let record = DatabaseRecord {
+                table_name: config.table.to_string(),
+                operation_type: "SELECT".to_string(),
+                timestamp: Utc::now(),
+                data: serde_json::Value::Object(data),
+                old_data: None,
+            };
+            simd_json::to_vec(&record).map_err(|e| {
+                Error::InvalidRecordValue(format!(
+                    "table '{}': failed to serialize row to JSON: {e}",
+                    config.table
+                ))
+            })?
+        } else {
+            simd_json::to_vec(&data).map_err(|e| {
+                Error::InvalidRecordValue(format!(
+                    "table '{}': failed to serialize row to JSON: {e}",
+                    config.table
+                ))
+            })?
+        };
+
         Ok(build_processed_row(
             config.table,
-            extracted_payload.unwrap(),
+            payload,
             max_offset,
             row_pk,
         ))

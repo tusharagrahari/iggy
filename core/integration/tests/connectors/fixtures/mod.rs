@@ -75,7 +75,8 @@ pub use mongodb::{
 };
 pub use mysql::{
     MySqlOps, MySqlSourceDeleteFixture, MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture,
-    MySqlSourceMarkFixture, MySqlSourceNoMetadataFixture, MySqlSourceOps, MySqlSourceRawFixture,
+    MySqlSourceMarkFixture, MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
+    MySqlSourceOps, MySqlSourceRawFixture,
 };
 pub use postgres::{
     PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,

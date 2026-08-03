@@ -19,7 +19,8 @@ use super::{DatabaseRecord, POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT}
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
     MySqlOps, MySqlSourceDeleteFixture, MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture,
-    MySqlSourceMarkFixture, MySqlSourceNoMetadataFixture, MySqlSourceOps, MySqlSourceRawFixture,
+    MySqlSourceMarkFixture, MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
+    MySqlSourceOps, MySqlSourceRawFixture,
 };
 use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, PollingStrategy};
@@ -260,6 +261,83 @@ async fn raw_rows_source_produces_raw_messages_to_iggy(
     for (i, payload) in received.iter().enumerate() {
         assert_eq!(payload, &payloads[i], "Payload mismatch at index {i}");
     }
+}
+
+/// A `payload_column` that no column matches must fail the table rather than
+/// silently serializing the whole row: the stream is configured as `raw`, so the
+/// fallback would publish a JSON envelope carrying a base64 rendering of the very
+/// blob the consumer expects verbatim.
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn missing_payload_column_source_produces_no_messages(
+    harness: &TestHarness,
+    fixture: MySqlSourceMissingPayloadColumnFixture,
+) {
+    let client = harness.root_client().await.unwrap();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    for i in 0..TEST_MESSAGE_COUNT {
+        fixture
+            .insert_payload(&pool, (i + 1) as i32, b"hello world")
+            .await;
+    }
+    pool.close().await;
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "test_consumer".try_into().unwrap();
+
+    let mut received: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            for msg in polled.messages {
+                received.push(msg.payload.to_vec());
+            }
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    assert!(
+        received.is_empty(),
+        "Expected no messages when payload_column is absent from the table, got {}: {:?}",
+        received.len(),
+        received
+            .iter()
+            .map(|payload| String::from_utf8_lossy(payload).into_owned())
+            .collect::<Vec<_>>()
+    );
+
+    // The rows stay in MySQL so the operator can fix the config and replay them.
+    let pool = fixture
+        .create_pool()
+        .await
+        .expect("Failed to recreate pool");
+    let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM `{}`",
+        fixture.table_name()
+    )))
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count rows");
+    pool.close().await;
+    assert_eq!(
+        remaining, TEST_MESSAGE_COUNT as i64,
+        "Rows must be left untouched when the table fails to process"
+    );
 }
 
 #[iggy_harness(

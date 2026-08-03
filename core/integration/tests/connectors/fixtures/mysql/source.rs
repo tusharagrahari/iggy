@@ -316,6 +316,92 @@ impl TestFixture for MySqlSourceRawFixture {
     }
 }
 
+/// MySQL source fixture whose `payload_column` names a column the table does not
+/// have, so the source must fail the table instead of falling back to whole-row
+/// JSON that would contradict the `raw` schema the stream is configured with.
+pub struct MySqlSourceMissingPayloadColumnFixture {
+    container: MySqlContainer,
+}
+
+impl MySqlOps for MySqlSourceMissingPayloadColumnFixture {
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl MySqlSourceOps for MySqlSourceMissingPayloadColumnFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl MySqlSourceMissingPayloadColumnFixture {
+    const TABLE: &'static str = "test_missing_payload";
+    const MISSPELLED_PAYLOAD_COLUMN: &'static str = "paylod";
+
+    pub async fn create_table(&self, pool: &Pool<MySql>) {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                payload BLOB NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+
+    pub async fn insert_payload(&self, pool: &Pool<MySql>, id: i32, payload: &[u8]) {
+        let query = format!("INSERT INTO `{}` (id, payload) VALUES (?, ?)", Self::TABLE);
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(id)
+            .bind(payload)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert payload: {e}"));
+    }
+}
+
+#[async_trait]
+impl TestFixture for MySqlSourceMissingPayloadColumnFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
+        envs.insert(
+            ENV_SOURCE_PAYLOAD_COLUMN.to_string(),
+            Self::MISSPELLED_PAYLOAD_COLUMN.to_string(),
+        );
+        envs.insert(ENV_SOURCE_PAYLOAD_FORMAT.to_string(), "bytea".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "raw".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            ENV_SOURCE_PLUGIN_PATH.to_string(),
+        );
+        envs
+    }
+}
+
 /// MySQL source fixture for a native `JSON` payload column.
 pub struct MySqlSourceJsonDirectFixture {
     container: MySqlContainer,

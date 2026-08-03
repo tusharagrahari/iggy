@@ -115,6 +115,8 @@ When `payload_column` is set, the connector extracts that column directly as the
 | `text` | `TEXT`, `VARCHAR` | `text` | UTF-8 text |
 | `json_direct` / `jsonb` | `JSON` | `json` | JSON object serialized to bytes |
 
+The column must be present in every polled result set. If it is missing (a typo, a dropped column, or a `custom_query` that does not project it), the connector fails that table each cycle and logs the table and column instead of falling back to whole-row JSON, which would publish bytes contradicting the configured schema. The rows stay in MySQL and are picked up once the config is corrected.
+
 ## Payload Format Examples
 
 ### BLOB (Raw Bytes)
