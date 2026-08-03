@@ -1146,7 +1146,7 @@ fn build_processed_row(
     max_offset: Option<String>,
     row_pk: Option<PkValue>,
 ) -> ProcessedRow {
-    let now = Utc::now().timestamp_millis() as u64;
+    let now = Utc::now().timestamp_micros() as u64;
     let pk_key = row_pk.as_ref().map(PkValue::as_key);
     let id = message_id(table, pk_key.as_deref().or(max_offset.as_deref()));
     ProcessedRow {
@@ -1731,5 +1731,23 @@ mod tests {
         // The contract-unreachable fallback must return an id rather than
         // panic; it is random, so we only assert it produces a value.
         let _ = message_id("users", None);
+    }
+
+    #[test]
+    fn given_produced_row_should_stamp_timestamps_in_microseconds() {
+        let before = Utc::now().timestamp_micros() as u64;
+        let row = build_processed_row("users", b"{}".to_vec(), Some("1".to_owned()), None);
+        let after = Utc::now().timestamp_micros() as u64;
+
+        let timestamp = row.message.timestamp.expect("timestamp should be set");
+        let origin_timestamp = row
+            .message
+            .origin_timestamp
+            .expect("origin timestamp should be set");
+        assert_eq!(timestamp, origin_timestamp);
+        assert!(
+            (before..=after).contains(&timestamp),
+            "timestamp {timestamp} is outside the micros range [{before}, {after}]"
+        );
     }
 }

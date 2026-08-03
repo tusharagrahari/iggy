@@ -23,7 +23,7 @@ use crate::connectors::fixtures::{
     MySqlSourceOps, MySqlSourceRawFixture,
 };
 use iggy_common::MessageClient;
-use iggy_common::{Consumer, Identifier, PollingStrategy};
+use iggy_common::{Consumer, Identifier, IggyTimestamp, PollingStrategy};
 use integration::harness::seeds;
 use integration::iggy_harness;
 use std::time::Duration;
@@ -41,6 +41,7 @@ async fn json_rows_source_produces_messages_to_iggy(
     let pool = fixture.create_pool().await.expect("Failed to create pool");
     fixture.create_table(&pool).await;
 
+    let window_start_micros = IggyTimestamp::now().as_micros();
     let test_messages = create_test_messages(TEST_MESSAGE_COUNT);
     for msg in &test_messages {
         fixture
@@ -62,6 +63,7 @@ async fn json_rows_source_produces_messages_to_iggy(
     let consumer_id: Identifier = "test_consumer".try_into().unwrap();
 
     let mut received: Vec<DatabaseRecord> = Vec::new();
+    let mut header_timestamps: Vec<(u64, u64)> = Vec::new();
     for _ in 0..POLL_ATTEMPTS {
         if let Ok(polled) = client
             .poll_messages(
@@ -78,6 +80,7 @@ async fn json_rows_source_produces_messages_to_iggy(
             for msg in polled.messages {
                 if let Ok(record) = serde_json::from_slice(&msg.payload) {
                     received.push(record);
+                    header_timestamps.push((msg.header.timestamp, msg.header.origin_timestamp));
                 }
             }
             if received.len() >= TEST_MESSAGE_COUNT {
@@ -92,6 +95,23 @@ async fn json_rows_source_produces_messages_to_iggy(
         "Expected at least {TEST_MESSAGE_COUNT} messages, got {}",
         received.len()
     );
+
+    // Header timestamps are microseconds on the wire. The runtime currently
+    // stamps them itself and drops the source's own values, so this guards the
+    // unit end to end for the day they get wired through; the plugin-side units
+    // are pinned by mysql_source's own unit test.
+    let window_end_micros = IggyTimestamp::now().as_micros();
+    let window = window_start_micros..=window_end_micros;
+    for (i, (timestamp, origin_timestamp)) in header_timestamps.iter().enumerate() {
+        assert!(
+            window.contains(timestamp),
+            "timestamp {timestamp} at record {i} is not microseconds in {window:?}"
+        );
+        assert!(
+            window.contains(origin_timestamp),
+            "origin timestamp {origin_timestamp} at record {i} is not microseconds in {window:?}"
+        );
+    }
 
     for (i, record) in received.iter().enumerate() {
         assert_eq!(
