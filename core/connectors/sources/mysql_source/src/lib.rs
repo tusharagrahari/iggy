@@ -172,6 +172,14 @@ impl Source for MySqlSource {
             self.id, self.config.tables
         );
 
+        // A zero batch would make every fetch look like a full batch, so `poll`
+        // would drop its pacing sleep and spin on `LIMIT 0` queries forever.
+        if self.config.batch_size == Some(0) {
+            return Err(Error::InitError(
+                "batch_size must be greater than 0; omit it to use the default of 1000".to_string(),
+            ));
+        }
+
         if let Some(ref col) = self.config.payload_column
             && !col.is_empty()
             && PayloadFormat::from_config(self.config.payload_format.as_deref())
@@ -1662,6 +1670,22 @@ mod tests {
         config.payload_format = Some("bytea".to_string());
         let source = MySqlSource::new(1, config, None);
         assert_eq!(source.payload_format(), PayloadFormat::Bytea);
+    }
+
+    #[test]
+    fn given_zero_batch_size_should_fail_open() {
+        // Zero would make every fetch count as a full batch, so poll would never
+        // sleep again and would spin on empty `LIMIT 0` queries.
+        let mut config = test_config();
+        config.batch_size = Some(0);
+        let mut source = MySqlSource::new(1, config, None);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(source.open());
+        assert!(
+            matches!(result, Err(Error::InitError(ref message)) if message.contains("batch_size")),
+            "expected an InitError naming batch_size, got {result:?}"
+        );
     }
 
     #[test]

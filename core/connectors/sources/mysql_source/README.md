@@ -49,7 +49,7 @@ custom_query = "SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit
 | `connection_string` | string | required | MySQL connection string (`mysql://user:pass@host:3306/db`) |
 | `tables` | array | required | List of tables to monitor |
 | `poll_interval` | string | `10s` | How often to poll (e.g., `1s`, `5m`) |
-| `batch_size` | u32 | `1000` | Max rows per poll |
+| `batch_size` | u32 | `1000` | Max rows per poll; must be greater than 0 |
 | `tracking_column` | string | `id` | Column for incremental polling; must be unique and monotonically increasing (see [Tracking Column Requirements](#tracking-column-requirements)) |
 | `initial_offset` | string | none | Starting value for tracking column |
 | `max_connections` | u32 | `10` | Max database connections |
