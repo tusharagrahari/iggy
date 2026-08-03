@@ -200,11 +200,15 @@ When using `custom_query`, these placeholders are available:
 
 | Placeholder | Replaced With |
 | ----------- | ------------- |
-| `$table` | Current table name |
+| `$table` | Current table name (required when more than one table is configured) |
 | `$offset` | Last processed offset (or `initial_offset`) |
 | `$limit` | `batch_size` value |
 | `$now` | Current UTC timestamp (RFC3339) |
 | `$now_unix` | Current Unix timestamp (seconds) |
+
+The query runs once per entry in `tables`, so with more than one table configured it must contain `$table`. A static query would otherwise execute unchanged for every table and publish the same rows repeatedly, each copy carrying a different table's metadata, message ID, and tracking offset. The connector rejects that combination at startup.
+
+A query that hardcodes its table still needs that table listed in `tables`. The list is what the connector polls — an empty list means it polls nothing — and the name is also the offset key, the input to the deterministic message ID, and the `table_name` metadata field.
 
 If the query uses `$offset`, it must be ordered by the tracking column in ascending order (`ORDER BY <tracking_column>` — MySQL sorts ascending by default, so `ASC` doesn't need to be spelled out). The connector takes the tracking value of the *last row returned* as the next `$offset`; without ascending order, that's not guaranteed to be the max, so rows can be skipped or re-emitted on the next poll.
 

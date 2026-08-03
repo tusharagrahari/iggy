@@ -172,6 +172,17 @@ impl Source for MySqlSource {
             self.id, self.config.tables
         );
 
+        // Every poll iterates `tables`, so an empty list makes the connector a
+        // silent no-op rather than an obvious misconfiguration.
+        if self.config.tables.is_empty() {
+            return Err(Error::InitError(
+                "tables must not be empty. Even when custom_query hardcodes the table, list it \
+                 here: the table name supplies the offset key, the deterministic message ID, \
+                 and the table_name metadata field"
+                    .to_string(),
+            ));
+        }
+
         // A zero batch would make every fetch look like a full batch, so `poll`
         // would drop its pacing sleep and spin on `LIMIT 0` queries forever.
         if self.config.batch_size == Some(0) {
@@ -535,13 +546,32 @@ impl MySqlSource {
         Ok(q)
     }
 
+    /// `custom_query` runs once per configured table, so the query and the table
+    /// list have to agree on how many distinct result sets they describe.
     fn validate_custom_query(&self, query: &str) -> Result<(), Error> {
         let query_upper = query.to_uppercase();
         if !query_upper.contains("SELECT") {
             warn!("Custom query should contain SELECT statement");
         }
         if query.contains("$table") && self.config.tables.is_empty() {
-            return Err(Error::InvalidConfig);
+            return Err(Error::InitError(
+                "custom_query uses $table but no tables are configured, so the placeholder \
+                 can never resolve; list the tables to poll in `tables`"
+                    .to_string(),
+            ));
+        }
+        // Without $table the same SQL is executed once per table, so identical rows
+        // would be emitted repeatedly, each carrying a different table's metadata,
+        // message ID, and tracking offset. Table identity is not recoverable from a
+        // static query, so reject the combination instead of guessing one.
+        if !query.contains("$table") && self.config.tables.len() > 1 {
+            return Err(Error::InitError(format!(
+                "custom_query has no $table placeholder but {} tables are configured ({}); \
+                 the same query would run once per table and emit its rows multiple times. \
+                 Use $table in the query, or configure a single table.",
+                self.config.tables.len(),
+                self.config.tables.join(", ")
+            )));
         }
         Ok(())
     }
@@ -1566,7 +1596,7 @@ mod tests {
         config.tables = vec![];
         let source = MySqlSource::new(1, config, None);
         let result = source.validate_custom_query("SELECT * FROM $table");
-        assert!(matches!(result, Err(Error::InvalidConfig)));
+        assert!(matches!(result, Err(Error::InitError(_))));
     }
 
     #[test]
@@ -1574,6 +1604,43 @@ mod tests {
         // A well-formed SELECT with tables configured passes validation.
         let source = MySqlSource::new(1, test_config(), None);
         let result = source.validate_custom_query("SELECT * FROM $table WHERE id > $offset");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn given_static_custom_query_and_multiple_tables_should_fail() {
+        // Without $table the identical SQL would run once per table, emitting the
+        // same rows under each table's metadata, message ID, and offset key.
+        let mut config = test_config();
+        config.tables = vec!["users".to_string(), "orders".to_string()];
+        let source = MySqlSource::new(1, config, None);
+        match source.validate_custom_query("SELECT * FROM events WHERE id > $offset") {
+            Err(Error::InitError(message)) => {
+                assert!(message.contains("users, orders"), "message was: {message}")
+            }
+            other => panic!("expected InitError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn given_table_placeholder_and_multiple_tables_should_pass() {
+        // The supported multi-table shape: $table resolves per table, so each one
+        // gets its own SQL, metadata, message IDs, and offset.
+        let mut config = test_config();
+        config.tables = vec!["users".to_string(), "orders".to_string()];
+        let source = MySqlSource::new(1, config, None);
+        let result = source.validate_custom_query("SELECT * FROM $table WHERE id > $offset");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn given_static_custom_query_and_single_table_should_pass() {
+        // One table leaves no ambiguity: the query runs once and its rows are
+        // attributed to the only configured table, so hardcoding it stays valid.
+        let mut config = test_config();
+        config.tables = vec!["users".to_string()];
+        let source = MySqlSource::new(1, config, None);
+        let result = source.validate_custom_query("SELECT * FROM users WHERE id > $offset");
         assert!(result.is_ok());
     }
 
@@ -1685,6 +1752,22 @@ mod tests {
         assert!(
             matches!(result, Err(Error::InitError(ref message)) if message.contains("batch_size")),
             "expected an InitError naming batch_size, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn given_empty_tables_should_fail_open() {
+        // Every poll iterates `tables`, so an empty list would leave the connector
+        // running and producing nothing instead of reporting the misconfiguration.
+        let mut config = test_config();
+        config.tables = vec![];
+        let mut source = MySqlSource::new(1, config, None);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(source.open());
+        assert!(
+            matches!(result, Err(Error::InitError(ref message)) if message.contains("tables")),
+            "expected an InitError naming tables, got {result:?}"
         );
     }
 
