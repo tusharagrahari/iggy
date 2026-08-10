@@ -56,17 +56,7 @@ pub struct MySqlSource {
     retry_delay: Duration,
     poll_interval: Duration,
     last_batch_full: AtomicBool,
-    /// Tables disabled after a tracking-column ordering violation. Deliberately
-    /// not persisted: the violation is deterministic and always a query or schema
-    /// problem, so a restart after fixing the config is the intended way to clear
-    /// it. Persisting would carry a stale verdict across a fix.
     poisoned_tables: Mutex<HashSet<String>>,
-    /// How each table's tracking values must be compared. Seeded at `open()` from
-    /// `information_schema`, then corrected on every fetch from the type MySQL
-    /// reports for the column in the result set itself. The result set is the
-    /// authority: it describes what the query actually returned, so it also covers
-    /// a `custom_query` projecting a computed column and a table that did not exist
-    /// at startup, neither of which `information_schema` can answer for.
     tracking_kinds: Mutex<HashMap<String, OffsetKind>>,
 }
 
@@ -104,18 +94,12 @@ pub enum PayloadFormat {
 
 struct ProcessedRow {
     message: ProducedMessage,
-    /// This row's value for the tracking column, not a running maximum. The batch
-    /// cursor is the value of the *last* row, which is only the maximum because
-    /// `OrderingGuard` rejects a batch whose values decrease.
     tracking_value: Option<String>,
     row_pk: Option<PkValue>,
 }
 
 /// Why a table's batch could not be produced.
 enum FetchError {
-    /// Rows within one batch decreased. Deterministic - the same query returns the
-    /// same rows in the same order every poll - so the table is disabled rather
-    /// than retried forever.
     Ordering(String),
     /// The batch opened below the cursor it was told to resume from. Retried rather
     /// than latched, because unlike a within-batch decrease this can come from the
@@ -123,16 +107,9 @@ enum FetchError {
     /// session time zone that moves backwards (a DST fall-back) reports lower wall
     /// clocks for later rows, and that resolves on its own.
     CursorRegression(String),
-    /// The result set does not carry the tracking column at all, so no row can yield
-    /// a cursor. A property of the query and the schema rather than of the rows, so
-    /// it is latched like `Ordering`: every poll would return the same result set,
-    /// re-publish it, and leave the offset where it was.
     MissingTrackingColumn(String),
-    /// The tracking column is projected but a row's value cannot become a cursor -
-    /// it is NULL, or a type with no ordered scalar form. Not latched, because a
-    /// single row can be corrected in place, but it does not clear on its own
-    /// either: the same row is re-read every poll until it is fixed.
     UnusableTrackingValue(String),
+    StaleOffsetKind(String),
     Other(Error),
 }
 
@@ -147,13 +124,8 @@ impl From<Error> for FetchError {
 /// content while the server orders them differently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OffsetKind {
-    /// A numeric SQL type: MySQL ordered by value, so "9" precedes "10".
     Numeric,
-    /// A string or temporal type: MySQL ordered by collation, so "10" precedes "5".
     Lexical,
-    /// The column type could not be resolved, which after the first fetch means the
-    /// query never returned the tracking column at all. Only pairs that decrease
-    /// under every applicable interpretation count as a violation.
     Unknown,
 }
 
@@ -186,25 +158,46 @@ fn offset_kind_for_data_type(data_type: &str) -> OffsetKind {
     }
 }
 
-/// Maps the type MySQL reports for a result-set column to the order it sorts in.
-/// Named after `sqlx`'s type names rather than `information_schema`'s, so the
-/// unsigned integer widths and `BOOLEAN` appear here and not in
-/// `offset_kind_for_data_type`.
-///
-/// Types `value_as_string` cannot render as a scalar - `BOOLEAN`, `JSON`, `NULL` -
-/// map to `Unknown` rather than being forced into an order. They never produce a
-/// cursor, so no comparison is reached, and claiming an order for them would be a
-/// lie the next reader has to unpick.
 fn offset_kind_for_type_name(type_name: &str) -> OffsetKind {
     match type_name {
         "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" | "TINYINT UNSIGNED"
         | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED" | "INT UNSIGNED" | "BIGINT UNSIGNED"
         | "FLOAT" | "DOUBLE" | "DECIMAL" | "BIT" | "YEAR" => OffsetKind::Numeric,
         "DATE" | "TIME" | "DATETIME" | "TIMESTAMP" | "CHAR" | "VARCHAR" | "TINYTEXT" | "TEXT"
-        | "MEDIUMTEXT" | "LONGTEXT" | "ENUM" | "SET" | "BINARY" | "VARBINARY" | "TINYBLOB"
-        | "BLOB" | "MEDIUMBLOB" | "LONGBLOB" => OffsetKind::Lexical,
+        | "MEDIUMTEXT" | "LONGTEXT" => OffsetKind::Lexical,
         _ => OffsetKind::Unknown,
     }
+}
+
+fn unusable_tracking_type(data_type: &str, column_type: &str) -> Option<&'static str> {
+    const BINARY: &[&str] = &[
+        "binary",
+        "varbinary",
+        "tinyblob",
+        "blob",
+        "mediumblob",
+        "longblob",
+    ];
+
+    if data_type.eq_ignore_ascii_case("json") || column_type.eq_ignore_ascii_case("tinyint(1)") {
+        return Some("it yields no ordered scalar cursor");
+    }
+    if BINARY
+        .iter()
+        .any(|binary| data_type.eq_ignore_ascii_case(binary))
+    {
+        return Some(
+            "binary values are carried as base64 text, which does not order the way the raw \
+             bytes do, and that text is what gets compared against the column",
+        );
+    }
+    if data_type.eq_ignore_ascii_case("enum") || data_type.eq_ignore_ascii_case("set") {
+        return Some(
+            "MySQL orders these by declaration index while only their labels reach the \
+             connector, and a bounded set of labels cannot be unique per row either",
+        );
+    }
+    None
 }
 
 /// The order the tracking column sorts in according to the result set that just
@@ -212,7 +205,7 @@ fn offset_kind_for_type_name(type_name: &str) -> OffsetKind {
 fn observed_tracking_kind(row: &MySqlRow, tracking_column: &str) -> Option<OffsetKind> {
     row.columns()
         .iter()
-        .find(|column| column.name() == tracking_column)
+        .find(|column| column.name().eq_ignore_ascii_case(tracking_column))
         .map(|column| offset_kind_for_type_name(column.type_info().name()))
         .filter(|kind| *kind != OffsetKind::Unknown)
 }
@@ -223,28 +216,23 @@ fn projected_columns(row: &MySqlRow) -> Vec<&str> {
     row.columns().iter().map(|column| column.name()).collect()
 }
 
-/// Rejects a result set that cannot produce a cursor at all. An alias renames a column
-/// for the result set, so `SELECT id AS row_id` does not project `id`.
 fn ensure_tracking_column_projected(
     projected: &[&str],
     tracking_column: &str,
 ) -> Result<(), FetchError> {
-    if projected.contains(&tracking_column) {
+    if projected
+        .iter()
+        .any(|column| column.eq_ignore_ascii_case(tracking_column))
+    {
         return Ok(());
     }
     Err(FetchError::MissingTrackingColumn(format!(
         "the result set has no column '{tracking_column}', it returned [{}]. Every row's cursor \
          comes from that column, so the same rows would be re-published on every poll while the \
-         stored offset never moved. Project the column under exactly that name - an alias is a \
-         different name - or point tracking_column at one the query returns.",
+         stored offset never moved.",
         projected.join(", ")
     )))
 }
-
-/// Rejects a row whose tracking value cannot become a cursor. Reached only once the
-/// column is known to be in the result set, so `None` here is the row's own value:
-/// NULL, or a type `value_as_string` cannot render as an ordered scalar (BOOLEAN,
-/// which is how MySQL reports `tinyint(1)`, and JSON).
 fn unusable_tracking_value(tracking_column: &str, pk: &str) -> FetchError {
     FetchError::UnusableTrackingValue(format!(
         "row (pk {pk}) has no usable value for tracking_column '{tracking_column}': it is NULL, or \
@@ -258,17 +246,6 @@ fn unusable_tracking_value(tracking_column: &str, pk: &str) -> FetchError {
 /// "cursor = last row's value" correct. The built polling query orders ascending by
 /// construction, so this only ever fires on a `custom_query`, where the operator
 /// owns the `ORDER BY`.
-///
-/// Checking the rows rather than the SQL text is deliberate. It is unaffected by
-/// how the ordering is expressed, and it catches cases no query analysis can:
-/// `ORDER BY` that MySQL discards inside a derived table, ordering by a column
-/// other than the tracking column, and `ORDER BY 1` resolving to an unexpected
-/// column.
-///
-/// The guard opens on the cursor the batch was told to resume from, so a batch that
-/// is internally ascending but starts *below* that cursor is caught too. Without
-/// that seed a `batch_size` of 1 defeats the check entirely: a single row has no
-/// pair to compare against.
 struct OrderingGuard<'a> {
     tracking_column: &'a str,
     kind: OffsetKind,
@@ -279,7 +256,6 @@ struct OrderingGuard<'a> {
     at_cursor: bool,
 }
 
-/// A batch that cannot be turned into a cursor, split by how it should be handled.
 enum OrderingViolation {
     WithinBatch(String),
     BelowCursor(String),
@@ -328,10 +304,6 @@ impl<'a> OrderingGuard<'a> {
     }
 }
 
-/// One table's fully processed but not-yet-committed work. Built in the
-/// side-effect-free first phase of `poll_tables`, then marked/deleted and
-/// published in the second phase so a table's messages are emitted only once
-/// its rows are marked.
 struct TableBatch {
     table: String,
     messages: Vec<ProducedMessage>,
@@ -377,7 +349,6 @@ pub struct DatabaseRecord {
     pub data: serde_json::Value,
     pub old_data: Option<serde_json::Value>,
 }
-
 #[derive(Clone, Copy)]
 struct RowProcessingConfig<'a> {
     table: &'a str,
@@ -422,6 +393,25 @@ impl Source for MySqlSource {
             return Err(Error::InitError(
                 "batch_size must be greater than 0; omit it to use the default of 1000".to_string(),
             ));
+        }
+
+        if self
+            .config
+            .tracking_column
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            let guidance = if self.config.custom_query.is_some() {
+                "the connector does not parse custom_query, so it has to be told which projected \
+                 column supplies the cursor: name the one the query orders by and filters with \
+                 $offset"
+            } else {
+                "it has to be unique and monotonically increasing under the order MySQL sorts it \
+                 in."
+            };
+            return Err(Error::InitError(format!(
+                "tracking_column must be set: every row's cursor is taken from it, and {guidance}."
+            )));
         }
 
         if let Some(ref col) = self.config.payload_column
@@ -595,26 +585,22 @@ impl MySqlSource {
         Ok(())
     }
 
+    /// The column every cursor is read from. `open()` refuses a config that leaves it
+    /// unset, so the fallback is unreachable in a running connector.
+    fn tracking_column(&self) -> &str {
+        self.config.tracking_column.as_deref().unwrap_or("id")
+    }
+
     /// Fail fast if a tracking column can't yield a stable, ordered scalar
     /// cursor. `value_as_string` drops NULL, tinyint(1) (decoded as BOOLEAN),
     /// and JSON to `None`, which silently stalls offset advancement and re-reads
     /// rows every cycle.
-    ///
-    /// Also resolves how each table's tracking values must be compared, because
-    /// offsets are carried as strings and the column's SQL type is the only thing
-    /// that says whether MySQL ordered them numerically or by collation.
-    ///
-    /// What a `custom_query` relaxes is only what a query can genuinely change. The
-    /// column type is rejected either way. Its absence from the table is not, since
-    /// the query may project it from somewhere else, and neither is nullability,
-    /// which a join or a filter moves in both directions. Both of those are then
-    /// caught per poll against the rows themselves, in `fetch_table_batch`.
     async fn resolve_tracking_columns(&self) -> Result<HashMap<String, OffsetKind>, Error> {
         // Whether the connector owns the query, and can therefore hold the schema to
         // what that query will do with it.
         let strict = self.config.custom_query.is_none();
         let pool = self.get_pool()?;
-        let tracking_column = self.config.tracking_column.as_deref().unwrap_or("id");
+        let tracking_column = self.tracking_column();
         let mut kinds = HashMap::with_capacity(self.config.tables.len());
 
         for table in &self.config.tables {
@@ -704,9 +690,7 @@ impl MySqlSource {
             // The column's type survives a plain projection, so it is worth rejecting
             // whatever the query looks like. A custom_query aliasing an expression onto
             // a name the table also uses is the one false positive, hence the hint.
-            if data_type.eq_ignore_ascii_case("json")
-                || column_type.eq_ignore_ascii_case("tinyint(1)")
-            {
+            if let Some(reason) = unusable_tracking_type(&data_type, &column_type) {
                 let aliasing_hint = if self.config.custom_query.is_some() {
                     " If custom_query aliases a different expression to this name, rename the \
                       alias so it does not collide with the column."
@@ -714,17 +698,12 @@ impl MySqlSource {
                     ""
                 };
                 return Err(Error::InitError(format!(
-                    "tracking_column '{tracking_column}' on table '{table}' has type '{column_type}', \
-                     which yields no ordered scalar cursor; use an integer, timestamp, or string \
+                    "tracking_column '{tracking_column}' on table '{table}' has type \
+                     '{column_type}': {reason}. Use an integer, timestamp, or string \
                      column.{aliasing_hint}"
                 )));
             }
 
-            // Nullability, unlike the type, is something a query changes in both
-            // directions: a LEFT JOIN puts NULLs in a NOT NULL column, and
-            // `WHERE ts IS NOT NULL` takes them out of a nullable one. So the declared
-            // flag only decides the outcome for the query the connector builds itself.
-            // Under a custom_query the poll-time check on the value is the authority.
             if is_nullable.eq_ignore_ascii_case("YES") {
                 if strict {
                     return Err(Error::InitError(format!(
@@ -866,7 +845,7 @@ impl MySqlSource {
         // discard, but a query with no ORDER BY at all is worth saying out loud at
         // startup rather than leaving to the first poll.
         if !query_upper.contains("ORDER BY") {
-            let tracking_column = self.config.tracking_column.as_deref().unwrap_or("id");
+            let tracking_column = self.tracking_column();
             warn!(
                 "custom_query has no ORDER BY. The next offset is the tracking value of the last \
                  row returned, which is only the highest one when the batch arrives ascending by \
@@ -1003,7 +982,7 @@ impl MySqlSource {
         let pool = self.get_pool()?;
 
         let batch_size = self.config.batch_size.unwrap_or(1000);
-        let tracking_column = self.config.tracking_column.as_deref().unwrap_or("id");
+        let tracking_column = self.tracking_column();
         let pk_column = self
             .config
             .primary_key_column
@@ -1082,6 +1061,14 @@ impl MySqlSource {
                         "Table '{table}' at offset {}: {reason} No rows were published and the \
                          offset was not advanced. The table stays enabled, since this can \
                          resolve without a config change.",
+                        last_offset.as_deref().unwrap_or("<start>")
+                    );
+                }
+                Err(FetchError::StaleOffsetKind(reason)) => {
+                    warn!(
+                        "Table '{table}' at offset {}: {reason} No rows were published and the \
+                         offset was not advanced. The next poll rebuilds the query from the type \
+                         the result set reported.",
                         last_offset.as_deref().unwrap_or("<start>")
                     );
                 }
@@ -1200,11 +1187,11 @@ impl MySqlSource {
             ..*row_config
         };
 
-        let kind = self.tracking_kind(table).await;
+        let query_kind = self.tracking_kind(table).await;
         let query = if let Some(custom_query) = &self.config.custom_query {
-            self.substitute_query_params(custom_query, table, last_offset, batch_size, kind)?
+            self.substitute_query_params(custom_query, table, last_offset, batch_size, query_kind)?
         } else {
-            self.build_polling_query(table, tracking_column, last_offset, batch_size, kind)?
+            self.build_polling_query(table, tracking_column, last_offset, batch_size, query_kind)?
         };
 
         // Database I/O without holding the lock
@@ -1221,35 +1208,48 @@ impl MySqlSource {
             ensure_tracking_column_projected(&projected_columns(first), tracking_column)?;
         }
 
-        let mut batch = TableBatch {
-            table: table.to_string(),
-            messages: Vec::with_capacity(rows.len()),
-            processed_ids: Vec::new(),
-            max_offset: None,
+        let resume_from = if self.cursor_gates_query() {
+            self.effective_offset(last_offset)
+        } else {
+            None
         };
+
         // The result set describes what this query actually returned, so it outranks
         // whatever `information_schema` said at startup and is the only answer
         // available for a computed column.
         let kind = match rows.first().and_then(|row| {
-            observed_tracking_kind(row, tracking_column).filter(|observed| *observed != kind)
+            observed_tracking_kind(row, tracking_column).filter(|observed| *observed != query_kind)
         }) {
             Some(observed) => {
                 self.tracking_kinds
                     .lock()
                     .await
                     .insert(table.to_string(), observed);
+                // The query was already sent with the stale kind, so its offset literal
+                // may be quoted for the wrong type.
+                if let Some(offset) = &resume_from
+                    && offset_literal_diverged(offset, query_kind, observed)
+                {
+                    return Err(FetchError::StaleOffsetKind(format!(
+                        "the poll filtered on '{tracking_column}' with {}, written for the \
+                         comparison order known before this poll, but the result set reports an \
+                         order whose literal is {}. A filter that disagrees with the query's own \
+                         ordering strands rows below the cursor permanently, so the batch was \
+                         discarded.",
+                        format_offset_value(offset, query_kind),
+                        format_offset_value(offset, observed)
+                    )));
+                }
                 observed
             }
-            None => kind,
+            None => query_kind,
         };
 
-        // Only a query whose filter is driven by the cursor can be held to it. A
-        // custom_query that never mentions $offset re-reads the same rows by design,
-        // and seeding the guard would read that as the cursor moving backwards.
-        let resume_from = if self.cursor_gates_query() {
-            self.effective_offset(last_offset)
-        } else {
-            None
+        let mut batch = TableBatch {
+            table: table.to_string(),
+            messages: Vec::with_capacity(rows.len()),
+            processed_ids: Vec::new(),
+            max_offset: None,
         };
         let mut ordering = OrderingGuard::new(tracking_column, kind, resume_from);
         for row in rows {
@@ -1300,14 +1300,14 @@ impl MySqlSource {
             let mut extracted_payload: Option<Vec<u8>> = None;
             for (i, column) in row.columns().iter().enumerate() {
                 let name = column.name();
-                if name == config.payload_col {
+                if name.eq_ignore_ascii_case(config.payload_col) {
                     extracted_payload =
                         Some(self.extract_payload_column(row, i, config.payload_format)?);
                 }
-                if name == config.tracking_column {
+                if name.eq_ignore_ascii_case(config.tracking_column) {
                     tracking_value = value_as_string(&extract_column_value(row, i)?);
                 }
-                if name == config.pk_column {
+                if name.eq_ignore_ascii_case(config.pk_column) {
                     row_pk = extract_pk_value(row, i)?;
                 }
             }
@@ -1339,10 +1339,10 @@ impl MySqlSource {
                 name.to_string()
             };
             let value = extract_column_value(row, i)?;
-            if name == config.tracking_column {
+            if name.eq_ignore_ascii_case(config.tracking_column) {
                 tracking_value = value_as_string(&value);
             }
-            if name == config.pk_column {
+            if name.eq_ignore_ascii_case(config.pk_column) {
                 row_pk = extract_pk_value(row, i)?;
             }
             data.insert(column_name, value);
@@ -1578,7 +1578,7 @@ fn extract_column_value(row: &MySqlRow, column_index: usize) -> Result<serde_jso
 fn pk_for_log(row: &MySqlRow, pk_column: &str) -> String {
     row.columns()
         .iter()
-        .position(|column| column.name() == pk_column)
+        .position(|column| column.name().eq_ignore_ascii_case(pk_column))
         .and_then(|index| extract_column_value(row, index).ok())
         .and_then(|value| value_as_string(&value))
         .unwrap_or_else(|| "unknown".to_string())
@@ -1716,6 +1716,15 @@ fn format_offset_value(value: &str, kind: OffsetKind) -> String {
             .replace('\0', "");
         format!("'{escaped}'")
     }
+}
+
+/// Whether a query built with `applied` filtered on a different literal than one
+/// built with `observed` would have. The kind reaches the SQL only through
+/// `format_offset_value` and the `ORDER BY` does not depend on it, so equal literals
+/// mean the two queries are the same query and a batch fetched under the stale kind
+/// is still the right batch.
+fn offset_literal_diverged(offset: &str, applied: OffsetKind, observed: OffsetKind) -> bool {
+    format_offset_value(offset, applied) != format_offset_value(offset, observed)
 }
 
 /// Compares two offsets as numbers, mirroring the numeric/string split in
@@ -2237,6 +2246,41 @@ mod tests {
     }
 
     #[test]
+    fn given_stale_kind_rendering_a_different_literal_should_report_divergence() {
+        // The first fetch on an unresolved table builds its filter from the cached
+        // kind. A numeric-looking offset against a column the result set then reports
+        // as collation-ordered is the case that strands rows: the filter ran
+        // numerically while ORDER BY sorted by collation.
+        assert!(offset_literal_diverged(
+            "200",
+            OffsetKind::Unknown,
+            OffsetKind::Lexical
+        ));
+        assert!(offset_literal_diverged(
+            "200",
+            OffsetKind::Numeric,
+            OffsetKind::Lexical
+        ));
+    }
+
+    #[test]
+    fn given_stale_kind_rendering_the_same_literal_should_not_report_divergence() {
+        // Both kinds emit the same literal, so the query was byte-identical to the one
+        // the corrected kind would have built and its batch is sound. Discarding it
+        // would drop the first batch of every table that was created after open().
+        assert!(!offset_literal_diverged(
+            "200",
+            OffsetKind::Unknown,
+            OffsetKind::Numeric
+        ));
+        assert!(!offset_literal_diverged(
+            "2024-01-01",
+            OffsetKind::Unknown,
+            OffsetKind::Lexical
+        ));
+    }
+
+    #[test]
     fn given_pk_value_should_produce_stable_message_key() {
         // as_key feeds the deterministic message id. Text passes through and
         // Bytes is base64, both matching the pre-typing value_as_string output,
@@ -2326,6 +2370,44 @@ mod tests {
             matches!(result, Err(Error::InitError(ref message)) if message.contains("tables")),
             "expected an InitError naming tables, got {result:?}"
         );
+    }
+
+    #[test]
+    fn given_unset_tracking_column_should_fail_open() {
+        // The column decides whether polling is lossless and the connector cannot
+        // verify a guess, so the operator has to name it. An empty string is the same
+        // omission spelled differently.
+        for unset in [None, Some(String::new())] {
+            let mut config = test_config();
+            config.tracking_column = unset.clone();
+            let mut source = MySqlSource::new(1, config, None);
+
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let result = runtime.block_on(source.open());
+            assert!(
+                matches!(result, Err(Error::InitError(ref message)) if message.contains("tracking_column must be set")),
+                "expected an InitError naming tracking_column for {unset:?}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_unset_tracking_column_with_custom_query_should_say_the_query_is_not_parsed() {
+        // On the built path the operator can restore the old default in one line; under
+        // a custom_query nothing can check that guess against the query's ORDER BY, so
+        // the message has to say why.
+        let mut config = test_config();
+        config.tracking_column = None;
+        config.custom_query =
+            Some("SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit".to_string());
+        let mut source = MySqlSource::new(1, config, None);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(source.open());
+        let Err(Error::InitError(message)) = result else {
+            panic!("expected an InitError, got {result:?}");
+        };
+        assert!(message.contains("does not parse custom_query"), "{message}");
     }
 
     #[test]
@@ -2548,6 +2630,48 @@ mod tests {
     }
 
     #[test]
+    fn given_declared_type_without_a_usable_cursor_should_be_rejected() {
+        // Each family for a different reason: no scalar form at all, base64 text that
+        // does not order like the bytes it stands for, and labels MySQL sorts by
+        // declaration index instead.
+        for (data_type, column_type) in [
+            ("json", "json"),
+            ("tinyint", "tinyint(1)"),
+            ("binary", "binary(16)"),
+            ("varbinary", "varbinary(255)"),
+            ("blob", "blob"),
+            ("longblob", "longblob"),
+            ("enum", "enum('new','done')"),
+            ("set", "set('a','b')"),
+        ] {
+            assert!(
+                unusable_tracking_type(data_type, column_type).is_some(),
+                "{column_type} cannot carry a cursor and must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn given_declared_type_with_a_usable_cursor_should_be_accepted() {
+        // tinyint is rejected only at display width 1, which is how MySQL spells
+        // BOOLEAN; a plain tinyint still orders numerically.
+        for (data_type, column_type) in [
+            ("int", "int"),
+            ("bigint", "bigint unsigned"),
+            ("tinyint", "tinyint(4)"),
+            ("varchar", "varchar(64)"),
+            ("timestamp", "timestamp"),
+            ("decimal", "decimal(20,4)"),
+        ] {
+            assert_eq!(
+                unusable_tracking_type(data_type, column_type),
+                None,
+                "{column_type} should be accepted as a tracking column"
+            );
+        }
+    }
+
+    #[test]
     fn given_query_shapes_defeating_text_inspection_should_reject_misordered_rows() {
         // The guard is deliberately independent of SQL syntax, so each shape is
         // expressed as the row order it actually produces. Every one of these
@@ -2727,15 +2851,29 @@ mod tests {
                 "{numeric} should sort numerically"
             );
         }
-        for lexical in ["VARCHAR", "TEXT", "DATETIME", "TIMESTAMP", "ENUM"] {
+        for lexical in ["VARCHAR", "TEXT", "DATETIME", "TIMESTAMP"] {
             assert_eq!(
                 offset_kind_for_type_name(lexical),
                 OffsetKind::Lexical,
                 "{lexical} should sort by collation"
             );
         }
-        // No scalar cursor comes out of these, so they get no claimed order.
-        for unknown in ["BOOLEAN", "JSON", "NULL", "GEOMETRY"] {
+        // No usable cursor comes out of these, so they get no claimed order: the first
+        // three yield no scalar at all, ENUM/SET sort by declaration index rather than
+        // by the labels that reach the connector, and binary values are compared as
+        // base64, which does not order the way their bytes do.
+        for unknown in [
+            "BOOLEAN",
+            "JSON",
+            "NULL",
+            "GEOMETRY",
+            "ENUM",
+            "SET",
+            "BINARY",
+            "VARBINARY",
+            "BLOB",
+            "LONGBLOB",
+        ] {
             assert_eq!(
                 offset_kind_for_type_name(unknown),
                 OffsetKind::Unknown,
@@ -2775,6 +2913,16 @@ mod tests {
         let error = ensure_tracking_column_projected(&["row_id", "name"], "id")
             .expect_err("a result set missing the tracking column must not produce a batch");
         assert!(matches!(error, FetchError::MissingTrackingColumn(_)));
+    }
+
+    #[test]
+    fn given_case_mismatched_tracking_column_should_accept_the_batch() {
+        // MySQL matches column identifiers case-insensitively, and so does the
+        // information_schema probe at open(), so `tracking_column = "ID"` against a
+        // column declared `id` starts up. An exact match here would then disable the
+        // table on every poll, telling the operator to fix an alias that never existed.
+        assert!(ensure_tracking_column_projected(&["id", "name"], "ID").is_ok());
+        assert!(ensure_tracking_column_projected(&["ID", "name"], "id").is_ok());
     }
 
     #[test]

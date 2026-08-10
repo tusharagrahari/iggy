@@ -50,7 +50,7 @@ custom_query = "SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit
 | `tables` | array | required | List of tables to monitor |
 | `poll_interval` | string | `10s` | How often to poll (e.g., `1s`, `5m`) |
 | `batch_size` | u32 | `1000` | Max rows per poll; must be greater than 0 |
-| `tracking_column` | string | `id` | Column for incremental polling; must be unique and monotonically increasing (see [Tracking Column Requirements](#tracking-column-requirements)) |
+| `tracking_column` | string | required | Column for incremental polling; must be unique and monotonically increasing (see [Tracking Column Requirements](#tracking-column-requirements)) |
 | `initial_offset` | string | none | Starting value for tracking column |
 | `max_connections` | u32 | `10` | Max database connections |
 | `snake_case_columns` | bool | `false` | Convert column names to snake_case |
@@ -69,6 +69,10 @@ custom_query = "SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit
 
 Polling is **insert-only**. Each poll runs roughly `SELECT ... WHERE tracking_column > last_offset ORDER BY tracking_column ASC LIMIT batch_size` and stores the largest tracking value it saw as the next offset. For this to be lossless the **`tracking_column` must be unique and monotonically increasing** — an auto-increment primary key is the canonical choice.
 
+`tracking_column` is required. It is the single field that decides whether polling loses rows, and the connector cannot check the choice for you: on the built-in query it reads the column's type and nullability but not the schema's intent, and a `custom_query` is substituted as text and never parsed, so nothing can confirm that the column you named is the one the query orders by.
+
+**On upgrade:** the field used to default to `id`. A deployment that relied on that default now fails at startup with an `InitError` naming the field; add `tracking_column = "id"` to restore the previous behavior, or take the opportunity to check that `id` really is unique and monotonically increasing in the order MySQL sorts it (a `CHAR(36)` UUIDv4 `id` passes every startup check and silently drops most of the table).
+
 The requirement is not cosmetic: if more than `batch_size` rows share the same tracking value, only the first `batch_size` are read and the next poll's `>` filter skips the rest of that value permanently. The same skip applies to `processed_column` and `delete_after_read`, because the tracking filter runs before those.
 
 For this reason a mutable, low-resolution column such as `updated_at` is **not** a safe tracking column: many rows commonly share the same second, and rows updated in place are never re-read. Capturing updates to existing rows is out of scope for polling.
@@ -78,9 +82,15 @@ Every row the connector publishes has to carry a usable value for that column, b
 - **The result set does not contain the column.** A query that never projects it, or projects it under another name — `SELECT id AS row_id` returns `row_id`, not `id` — leaves no row able to move the cursor, so the same result set would be published on every poll forever. The batch is rejected before anything is published and the table is **disabled until the connector restarts**: the query cannot start returning the column on its own. The error lists the columns the query did return.
 - **A row's value is NULL, or of a type with no ordered scalar form** (`tinyint(1)`, `JSON`). The batch is rejected the same way, but the table **stays enabled**, since an `UPDATE` can repair the row and the next poll will then pick it up. Until that happens the table publishes nothing and the error repeats every poll — it is a stall, not a transient.
 
-Neither case loses anything: nothing is published, no row is marked or deleted, and the stored offset does not move.
+Neither of the two loses anything: nothing is published, no row is marked or deleted, and the stored offset does not move.
 
-At startup the connector also reads the column from `information_schema` and refuses to start if its type is `JSON` or `tinyint(1)`, whether or not a `custom_query` is set — a projection cannot change a column's type.
+The name is matched the way MySQL matches identifiers, case-insensitively, so `tracking_column = "ID"` and a column declared `id` are the same column. An alias still is not. `primary_key_column` and `payload_column` are matched the same way.
+
+At startup the connector also reads the column from `information_schema` and refuses to start on a type that cannot carry a cursor, whether or not a `custom_query` is set — a projection cannot change a column's type. Rejected types and why:
+
+- `JSON` and `tinyint(1)` have no ordered scalar form, so no row would ever produce a cursor.
+- `BINARY`, `VARBINARY` and the `BLOB` family are carried as base64 text, which does not order the way the underlying bytes do. The cursor would be compared in one order while `ORDER BY` used another, and the base64 literal would be compared against raw bytes. `BINARY(16)` UUID keys are the common case here; track an auto-increment key or a `CHAR(36)` column instead.
+- `ENUM` and `SET` are sorted by MySQL on declaration index, not on the label the connector sees, so the two disagree whenever the members are not declared in alphabetical order. A bounded set of labels cannot be unique per row either.
 
 A nullable column is refused only when the connector builds its own query. With a `custom_query` it is a warning instead, because a query moves nullability in both directions: a `LEFT JOIN` introduces NULLs into a `NOT NULL` column, `WHERE ts IS NOT NULL` removes them from a nullable one. The per-poll check above catches an actual NULL.
 
@@ -274,6 +284,14 @@ The type is read from the result set the query returns, which also settles it fo
 projecting a computed column that has no `information_schema` row of its own, and for a table that
 did not exist when the connector started. `information_schema` is still consulted at startup, for the
 `NOT NULL` and column-type checks above.
+
+The result set only arrives after the query has run, so when startup could not resolve the column the
+first poll is built from that unresolved answer. If the type the result set reports would have
+written the `$offset` literal differently — a bare `200` against what turns out to be a `VARCHAR`
+column, which MySQL compares numerically while `ORDER BY` compares by collation — that batch is
+discarded: nothing is published, no row is marked or deleted, and the offset does not advance. The
+corrected type is already stored, so the next poll rebuilds the query and reads the same rows under a
+filter that agrees with its own ordering. It is logged once per occurrence and does not repeat.
 
 For collation-ordered columns a decrease is only reported when case-sensitive and case-insensitive
 comparisons agree, since the collation itself is not known (`utf8mb4_0900_ai_ci` orders `a` before
