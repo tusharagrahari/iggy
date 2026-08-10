@@ -18,9 +18,12 @@
 use super::{DatabaseRecord, POLL_ATTEMPTS, POLL_INTERVAL_MS, TEST_MESSAGE_COUNT};
 use crate::connectors::create_test_messages;
 use crate::connectors::fixtures::{
-    MySqlOps, MySqlSourceDeleteFixture, MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture,
-    MySqlSourceMarkFixture, MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
-    MySqlSourceOps, MySqlSourceRawFixture,
+    MySqlOps, MySqlSourceAliasedTrackingFixture, MySqlSourceComputedTrackingFixture,
+    MySqlSourceDeleteFixture, MySqlSourceDescendingQueryFixture, MySqlSourceJsonDirectFixture,
+    MySqlSourceJsonFixture, MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture,
+    MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
+    MySqlSourceNullTrackingFixture, MySqlSourceOps, MySqlSourceRawFixture,
+    MySqlSourceTextTrackingFixture,
 };
 use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, IggyTimestamp, PollingStrategy};
@@ -714,4 +717,455 @@ async fn state_persists_across_connector_restart(
     }
 
     pool.close().await;
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn descending_custom_query_publishes_nothing_and_leaves_rows_in_place(
+    harness: &TestHarness,
+    fixture: MySqlSourceDescendingQueryFixture,
+) {
+    // A custom query ordered DESC returns readable rows whose tracking values
+    // decrease. Taking the last row's value as the cursor would move it backwards
+    // and skip every row above it, so the connector must abandon the cycle: nothing
+    // is published, and the rows stay in MySQL to be picked up once the query is
+    // corrected.
+    let client = harness.root_client().await.unwrap();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    for i in 0..TEST_MESSAGE_COUNT {
+        fixture.insert_row(&pool, &format!("row_{i}")).await;
+    }
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "descending_consumer".try_into().unwrap();
+
+    let mut received = 0usize;
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            received += polled.messages.len();
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    assert_eq!(
+        received, 0,
+        "Expected no messages from a descending custom query, got {received}"
+    );
+
+    let remaining = fixture.count_rows(&pool).await;
+    pool.close().await;
+    assert_eq!(
+        remaining, TEST_MESSAGE_COUNT as i64,
+        "Expected all {TEST_MESSAGE_COUNT} rows to remain in MySQL, found {remaining}"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn descending_computed_tracking_column_publishes_nothing_and_leaves_rows_in_place(
+    harness: &TestHarness,
+    fixture: MySqlSourceComputedTrackingFixture,
+) {
+    // The tracking column is an alias the query computes, so it has no
+    // information_schema row and the comparison order can only come from the type
+    // MySQL reports for it in the result set.
+    //
+    // The ids are chosen so that only the typed reading catches the reversal:
+    // descending gives 100 then 99, which decreases numerically but *increases* by
+    // collation, so a comparison that has to satisfy both readings lets the batch
+    // through and strands row 99. Consecutive ids would not isolate this - 9 then 8
+    // decreases under both.
+    const IDS: [i32; 2] = [99, 100];
+
+    let client = harness.root_client().await.unwrap();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    for id in IDS {
+        fixture.insert_row(&pool, id, &format!("row_{id}")).await;
+    }
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "computed_tracking_consumer".try_into().unwrap();
+
+    let mut received = 0usize;
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            received += polled.messages.len();
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    assert_eq!(
+        received, 0,
+        "Expected no messages from a descending computed tracking column, got {received}"
+    );
+
+    let remaining = fixture.count_rows(&pool).await;
+    pool.close().await;
+    assert_eq!(
+        remaining,
+        IDS.len() as i64,
+        "Expected all {} rows to remain in MySQL, found {remaining}",
+        IDS.len()
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn text_tracking_column_keeps_reading_values_below_the_numeric_maximum(
+    harness: &TestHarness,
+    fixture: MySqlSourceTextTrackingFixture,
+) {
+    // `code` is a VARCHAR, so MySQL orders it by collation: '100' sorts before '2'
+    // and the largest value is '5'. Writing the offset into the query as a bare
+    // number makes MySQL convert the column and the literal to a double, filtering
+    // numerically while ORDER BY sorts by collation, which walks the cursor up to
+    // the numeric maximum '100'. A later '7' is then below that filter forever,
+    // even though it sorts after '5' and has never been read.
+    const SEEDED: [&str; 6] = ["1", "2", "5", "10", "42", "100"];
+    const LATE: &str = "7";
+
+    let client = harness.root_client().await.unwrap();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    for code in SEEDED {
+        fixture.insert_row(&pool, code).await;
+    }
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "text_tracking_consumer".try_into().unwrap();
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut inserted_late = false;
+    let mut late_seen = false;
+
+    for _ in 0..(POLL_ATTEMPTS * 2) {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                50,
+                true,
+            )
+            .await
+        {
+            for message in polled.messages {
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&message.payload)
+                    && let Some(code) = json.get("code").and_then(|code| code.as_str())
+                {
+                    seen.push(code.to_string());
+                }
+            }
+        }
+
+        // '7' sorts after the collation maximum '5' but sits below the numeric
+        // maximum '100', so it is only reachable while the filter stays lexical.
+        // It goes in once the seeded rows have been read, so the cursor has
+        // already had every chance to climb.
+        if !inserted_late && SEEDED.iter().all(|code| seen.iter().any(|s| s == code)) {
+            fixture.insert_row(&pool, LATE).await;
+            inserted_late = true;
+        }
+        if inserted_late && seen.iter().any(|code| code == LATE) {
+            late_seen = true;
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    pool.close().await;
+    assert!(
+        inserted_late,
+        "Expected every seeded code to be published before inserting '{LATE}', got {seen:?}"
+    );
+    assert!(
+        late_seen,
+        "Row '{LATE}' was never published: the offset filter compared numerically \
+         while MySQL ordered by collation, so it is stranded below the cursor. Saw {seen:?}"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn custom_query_aliasing_the_tracking_column_publishes_nothing_and_stays_disabled(
+    harness: &TestHarness,
+    fixture: MySqlSourceAliasedTrackingFixture,
+) {
+    // `SELECT id AS row_id` returns no `id`, so no row can yield a cursor. Publishing
+    // the batch anyway would emit every row and leave the offset unset, replaying the
+    // same result set on every poll. The query cannot correct itself, so the table is
+    // disabled: rows inserted later must not be published either.
+    let client = harness.root_client().await.unwrap();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    for i in 0..TEST_MESSAGE_COUNT {
+        fixture.insert_row(&pool, &format!("row_{i}")).await;
+    }
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "aliased_tracking_consumer".try_into().unwrap();
+
+    let mut received = 0usize;
+    let mut inserted_more = false;
+    for attempt in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            received += polled.messages.len();
+        }
+
+        // New rows partway through: a table that merely skipped a cycle would pick
+        // these up, a disabled one stays silent.
+        if !inserted_more && attempt == POLL_ATTEMPTS / 2 {
+            for i in 0..TEST_MESSAGE_COUNT {
+                fixture.insert_row(&pool, &format!("late_{i}")).await;
+            }
+            inserted_more = true;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    let expected_rows = (TEST_MESSAGE_COUNT * 2) as i64;
+    let remaining = fixture.count_rows(&pool).await;
+    pool.close().await;
+
+    assert_eq!(
+        received, 0,
+        "Expected no messages from a query that does not project the tracking column, \
+         got {received}"
+    );
+    assert_eq!(
+        remaining, expected_rows,
+        "Expected all {expected_rows} rows to remain in MySQL, found {remaining}"
+    );
+
+    // Publishing nothing is also what a per-row rejection would produce, so pin down
+    // which check fired: only the result-set check can name the columns the query
+    // returned, and only it disables the table.
+    let (stdout, stderr) = harness
+        .connectors_runtime()
+        .expect("connectors runtime should be running")
+        .collect_logs();
+    let logs = format!("{stdout}{stderr}");
+    assert!(
+        logs.contains("the result set has no column 'id'"),
+        "Expected the result-set check to reject the batch and name the tracking column"
+    );
+    assert!(
+        logs.contains("row_id, name"),
+        "Expected the error to list the columns the query actually returned"
+    );
+    assert!(
+        logs.contains("the table is disabled"),
+        "Expected the table to be disabled rather than retried, since the query cannot \
+         correct itself"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn null_tracking_value_publishes_nothing_until_the_row_is_repaired(
+    harness: &TestHarness,
+    fixture: MySqlSourceNullTrackingFixture,
+) {
+    // A NULL tracking value yields no cursor, so the batch must fail before anything
+    // is published. Unlike a query that cannot project the column, the row itself can
+    // be fixed, so the table stays enabled: once the values are backfilled every row
+    // must arrive, which is also what proves the offset never moved while it stalled.
+    let client = harness.root_client().await.unwrap();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    for i in 0..TEST_MESSAGE_COUNT {
+        fixture.insert_row(&pool, &format!("row_{i}")).await;
+    }
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "null_tracking_consumer".try_into().unwrap();
+
+    let mut received = 0usize;
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            received += polled.messages.len();
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    assert_eq!(
+        received, 0,
+        "Expected no messages while every tracking value is NULL, got {received}"
+    );
+
+    fixture.backfill_tracking_values(&pool).await;
+
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            received += polled.messages.len();
+        }
+        if received >= TEST_MESSAGE_COUNT {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    let remaining = fixture.count_rows(&pool).await;
+    pool.close().await;
+
+    // At-least-once, so a repaired row may arrive more than once. What the assertion
+    // is for is that the rows arrive at all, without restarting the connector: the
+    // table was never disabled, and the offset never moved past rows it had not
+    // published. The zero above is what makes the pair discriminating.
+    assert!(
+        received >= TEST_MESSAGE_COUNT,
+        "Expected all {TEST_MESSAGE_COUNT} rows once the tracking values were repaired, \
+         got {received}: the table was disabled, or the offset advanced past rows that \
+         were never published"
+    );
+    assert_eq!(
+        remaining, TEST_MESSAGE_COUNT as i64,
+        "Expected all {TEST_MESSAGE_COUNT} rows to remain in MySQL, found {remaining}"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn json_tracking_column_fails_startup_even_with_a_custom_query(
+    harness: &TestHarness,
+    fixture: MySqlSourceJsonTrackingFixture,
+) {
+    // A JSON column has no ordered scalar form, so it can never produce a cursor. The
+    // type is a property of the column that a projection preserves, so a custom_query
+    // does not excuse it: the connector must refuse to start rather than poll a table
+    // whose offset can never advance. The fixture creates the table before the runtime
+    // starts, since a table that does not exist yet defers validation instead.
+    let client = harness.root_client().await.unwrap();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+
+    for i in 0..TEST_MESSAGE_COUNT {
+        fixture.insert_row(&pool, &format!("row_{i}")).await;
+    }
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "json_tracking_consumer".try_into().unwrap();
+
+    let mut received = 0usize;
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            received += polled.messages.len();
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    let remaining = fixture.count_rows(&pool).await;
+    pool.close().await;
+
+    assert_eq!(
+        received, 0,
+        "Expected no messages from a connector that must not start, got {received}"
+    );
+    assert_eq!(
+        remaining, TEST_MESSAGE_COUNT as i64,
+        "Expected all {TEST_MESSAGE_COUNT} rows to remain in MySQL, found {remaining}"
+    );
+
+    // Refusing at startup is what separates this from a connector that runs and
+    // rejects every batch; both publish nothing.
+    let (stdout, stderr) = harness
+        .connectors_runtime()
+        .expect("connectors runtime should be running")
+        .collect_logs();
+    let logs = format!("{stdout}{stderr}");
+    assert!(
+        logs.contains("Plugin initialization failed"),
+        "Expected the connector to fail open() on a JSON tracking column"
+    );
 }

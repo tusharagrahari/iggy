@@ -16,9 +16,9 @@
 // under the License.
 
 use super::container::{
-    DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SOURCE_CONNECTION_STRING,
-    ENV_SOURCE_DELETE_AFTER_READ, ENV_SOURCE_INCLUDE_METADATA, ENV_SOURCE_PATH,
-    ENV_SOURCE_PAYLOAD_COLUMN, ENV_SOURCE_PAYLOAD_FORMAT, ENV_SOURCE_PLUGIN_PATH,
+    DEFAULT_TEST_STREAM, DEFAULT_TEST_TOPIC, ENV_SOURCE_CONNECTION_STRING, ENV_SOURCE_CUSTOM_QUERY,
+    ENV_SOURCE_DELETE_AFTER_READ, ENV_SOURCE_INCLUDE_METADATA, ENV_SOURCE_INITIAL_OFFSET,
+    ENV_SOURCE_PATH, ENV_SOURCE_PAYLOAD_COLUMN, ENV_SOURCE_PAYLOAD_FORMAT, ENV_SOURCE_PLUGIN_PATH,
     ENV_SOURCE_POLL_INTERVAL, ENV_SOURCE_PRIMARY_KEY_COLUMN, ENV_SOURCE_PROCESSED_COLUMN,
     ENV_SOURCE_STREAMS_0_SCHEMA, ENV_SOURCE_STREAMS_0_STREAM, ENV_SOURCE_STREAMS_0_TOPIC,
     ENV_SOURCE_TABLES, ENV_SOURCE_TRACKING_COLUMN, MySqlContainer, MySqlOps, MySqlSourceOps,
@@ -672,6 +672,613 @@ impl TestFixture for MySqlSourceMarkFixture {
         envs.insert(
             ENV_SOURCE_PROCESSED_COLUMN.to_string(),
             "is_processed".to_string(),
+        );
+        envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            ENV_SOURCE_PLUGIN_PATH.to_string(),
+        );
+        envs
+    }
+}
+
+/// MySQL source fixture tracking a `VARCHAR` column that holds digit-like values.
+///
+/// MySQL orders this column by collation, so `'100'` sorts before `'2'`. If the
+/// offset is written into the query as a bare number, MySQL converts the column and
+/// the literal to a double and the filter compares numerically while `ORDER BY`
+/// compares by collation. The cursor then climbs to the numeric maximum and every
+/// value below it becomes unreachable, however far its collation order says it
+/// should still be read.
+pub struct MySqlSourceTextTrackingFixture {
+    container: MySqlContainer,
+}
+
+impl MySqlOps for MySqlSourceTextTrackingFixture {
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl MySqlSourceOps for MySqlSourceTextTrackingFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl MySqlSourceTextTrackingFixture {
+    const TABLE: &'static str = "test_text_tracking";
+
+    pub async fn create_table(&self, pool: &Pool<MySql>) {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                code VARCHAR(8) NOT NULL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+
+    pub async fn insert_row(&self, pool: &Pool<MySql>, code: &str) {
+        let query = format!("INSERT INTO `{}` (code, name) VALUES (?, ?)", Self::TABLE);
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(code)
+            .bind(format!("row_{code}"))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+}
+
+#[async_trait]
+impl TestFixture for MySqlSourceTextTrackingFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "code".to_string());
+        envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "false".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            ENV_SOURCE_PLUGIN_PATH.to_string(),
+        );
+        envs
+    }
+}
+
+/// MySQL source fixture whose `custom_query` orders rows descending by a computed
+/// column that does not exist on the table.
+///
+/// `information_schema` has no row for `tracking_id`, so the comparison order can
+/// only come from the type MySQL reports for it in the result set. Without that,
+/// descending values like 100, 99 read as a decrease numerically and an increase by
+/// collation, the two disagree, and the batch is let through - skipping every row
+/// below the top of the first batch, permanently.
+pub struct MySqlSourceComputedTrackingFixture {
+    container: MySqlContainer,
+}
+
+impl MySqlOps for MySqlSourceComputedTrackingFixture {
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl MySqlSourceOps for MySqlSourceComputedTrackingFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl MySqlSourceComputedTrackingFixture {
+    const TABLE: &'static str = "test_computed_tracking";
+
+    pub async fn create_table(&self, pool: &Pool<MySql>) {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(255) NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+
+    /// Takes an explicit id because which ids are used is the point of the test.
+    pub async fn insert_row(&self, pool: &Pool<MySql>, id: i32, name: &str) {
+        let query = format!("INSERT INTO `{}` (id, name) VALUES (?, ?)", Self::TABLE);
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(id)
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+
+    pub async fn count_rows(&self, pool: &Pool<MySql>) -> i64 {
+        MySqlSourceOps::count_rows(self, pool).await
+    }
+}
+
+#[async_trait]
+impl TestFixture for MySqlSourceComputedTrackingFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(
+            ENV_SOURCE_TRACKING_COLUMN.to_string(),
+            "tracking_id".to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_CUSTOM_QUERY.to_string(),
+            "SELECT *, id AS tracking_id FROM $table WHERE id > $offset \
+             ORDER BY tracking_id DESC LIMIT $limit"
+                .to_string(),
+        );
+        envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            ENV_SOURCE_PLUGIN_PATH.to_string(),
+        );
+        envs
+    }
+}
+
+/// MySQL source fixture whose `custom_query` orders rows descending.
+///
+/// The rows are correctly readable, but the batch's tracking values decrease, so
+/// the cursor would move backwards and skip rows. Exercises the ordering guard:
+/// the connector must publish nothing and disable the table rather than advance
+/// its offset.
+pub struct MySqlSourceDescendingQueryFixture {
+    container: MySqlContainer,
+}
+
+impl MySqlOps for MySqlSourceDescendingQueryFixture {
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl MySqlSourceOps for MySqlSourceDescendingQueryFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl MySqlSourceDescendingQueryFixture {
+    const TABLE: &'static str = "test_descending_rows";
+
+    pub async fn create_table(&self, pool: &Pool<MySql>) {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(255) NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+
+    pub async fn insert_row(&self, pool: &Pool<MySql>, name: &str) {
+        let query = format!("INSERT INTO `{}` (name) VALUES (?)", Self::TABLE);
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+
+    pub async fn count_rows(&self, pool: &Pool<MySql>) -> i64 {
+        MySqlSourceOps::count_rows(self, pool).await
+    }
+}
+
+#[async_trait]
+impl TestFixture for MySqlSourceDescendingQueryFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
+        envs.insert(
+            ENV_SOURCE_CUSTOM_QUERY.to_string(),
+            "SELECT * FROM $table WHERE id > $offset ORDER BY id DESC LIMIT $limit".to_string(),
+        );
+        envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            ENV_SOURCE_PLUGIN_PATH.to_string(),
+        );
+        envs
+    }
+}
+
+/// MySQL source fixture whose `custom_query` aliases the tracking column away.
+///
+/// `SELECT id AS row_id` returns a result set with no `id` in it, so no row can yield
+/// a cursor. The connector would otherwise publish every row and leave the offset
+/// unset, replaying the same result set on every poll forever. The column exists on
+/// the table, so the startup probe passes and only the result set can catch this.
+pub struct MySqlSourceAliasedTrackingFixture {
+    container: MySqlContainer,
+}
+
+impl MySqlOps for MySqlSourceAliasedTrackingFixture {
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl MySqlSourceOps for MySqlSourceAliasedTrackingFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl MySqlSourceAliasedTrackingFixture {
+    const TABLE: &'static str = "test_aliased_tracking";
+
+    pub async fn create_table(&self, pool: &Pool<MySql>) {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(255) NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+
+    pub async fn insert_row(&self, pool: &Pool<MySql>, name: &str) {
+        let query = format!("INSERT INTO `{}` (name) VALUES (?)", Self::TABLE);
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+
+    pub async fn count_rows(&self, pool: &Pool<MySql>) -> i64 {
+        MySqlSourceOps::count_rows(self, pool).await
+    }
+}
+
+#[async_trait]
+impl TestFixture for MySqlSourceAliasedTrackingFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "id".to_string());
+        envs.insert(
+            ENV_SOURCE_CUSTOM_QUERY.to_string(),
+            "SELECT id AS row_id, name FROM $table WHERE id > $offset \
+             ORDER BY row_id LIMIT $limit"
+                .to_string(),
+        );
+        envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            ENV_SOURCE_PLUGIN_PATH.to_string(),
+        );
+        envs
+    }
+}
+
+/// MySQL source fixture whose tracking column is projected but NULL.
+///
+/// A NULL yields no cursor, so publishing the row would advance nothing and the same
+/// rows would be re-read forever. Unlike a missing column this is the row's own value,
+/// which an `UPDATE` can fix, so the table must stay enabled and recover on its own
+/// once it is. The column is nullable and a `custom_query` is set, which is exactly
+/// the combination the startup probe cannot decide: a query can filter NULLs out of a
+/// nullable column just as easily as a join can put them into a `NOT NULL` one.
+pub struct MySqlSourceNullTrackingFixture {
+    container: MySqlContainer,
+}
+
+impl MySqlOps for MySqlSourceNullTrackingFixture {
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl MySqlSourceOps for MySqlSourceNullTrackingFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl MySqlSourceNullTrackingFixture {
+    const TABLE: &'static str = "test_null_tracking";
+    /// Any fixed point in the past; `+ id` spreads the repaired rows out in `id`
+    /// order so the batch that follows the repair is ascending.
+    const BACKFILL_EPOCH: i64 = 1_700_000_000;
+    /// Below every repaired value, and non-numeric, which the tracking column being a
+    /// `DATETIME` makes natural: the config env provider types a bare `0` as a number
+    /// and then fails to deserialize it into the string field `initial_offset`.
+    const INITIAL_OFFSET: &'static str = "2000-01-01 00:00:00";
+
+    pub async fn create_table(&self, pool: &Pool<MySql>) {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                updated_at DATETIME NULL,
+                name VARCHAR(255) NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+
+    /// Inserts a row whose tracking column is NULL.
+    pub async fn insert_row(&self, pool: &Pool<MySql>, name: &str) {
+        let query = format!(
+            "INSERT INTO `{}` (updated_at, name) VALUES (NULL, ?)",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+
+    /// Gives every row a usable tracking value, as an operator repairing the data
+    /// would. Distinct and ascending by `id`, so the repaired batch is ordered. The
+    /// table was never disabled, so the next poll must pick every row up.
+    pub async fn backfill_tracking_values(&self, pool: &Pool<MySql>) {
+        let query = format!(
+            "UPDATE `{}` SET updated_at = FROM_UNIXTIME({} + id) WHERE updated_at IS NULL",
+            Self::TABLE,
+            Self::BACKFILL_EPOCH
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to backfill tracking values: {e}"));
+    }
+
+    pub async fn count_rows(&self, pool: &Pool<MySql>) -> i64 {
+        MySqlSourceOps::count_rows(self, pool).await
+    }
+}
+
+#[async_trait]
+impl TestFixture for MySqlSourceNullTrackingFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(
+            ENV_SOURCE_TRACKING_COLUMN.to_string(),
+            "updated_at".to_string(),
+        );
+        envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "id".to_string());
+        envs.insert(
+            ENV_SOURCE_INITIAL_OFFSET.to_string(),
+            Self::INITIAL_OFFSET.to_string(),
+        );
+        // `IS NULL` is what puts the unusable rows in the result set at all: a NULL
+        // fails every comparison, so the $offset filter alone would hide them and the
+        // connector would have nothing to reject.
+        envs.insert(
+            ENV_SOURCE_CUSTOM_QUERY.to_string(),
+            "SELECT * FROM $table WHERE (updated_at > $offset OR updated_at IS NULL) \
+             ORDER BY updated_at LIMIT $limit"
+                .to_string(),
+        );
+        envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            ENV_SOURCE_PLUGIN_PATH.to_string(),
+        );
+        envs
+    }
+}
+
+/// MySQL source fixture whose tracking column is a `JSON` column, with a
+/// `custom_query` set.
+///
+/// A `JSON` column has no ordered scalar form, so it can never yield a cursor. The
+/// startup probe rejects the type whether or not a `custom_query` is set, because a
+/// projection cannot change it, and the connector must refuse to start rather than
+/// poll a table it can never advance.
+///
+/// Unlike every other fixture here, the table is created during `setup()`: the
+/// harness starts the connectors runtime before the test body runs, and a table that
+/// does not exist yet defers validation instead of failing it.
+pub struct MySqlSourceJsonTrackingFixture {
+    container: MySqlContainer,
+}
+
+impl MySqlOps for MySqlSourceJsonTrackingFixture {
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl MySqlSourceOps for MySqlSourceJsonTrackingFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl MySqlSourceJsonTrackingFixture {
+    const TABLE: &'static str = "test_json_tracking";
+
+    pub async fn insert_row(&self, pool: &Pool<MySql>, name: &str) {
+        let query = format!(
+            "INSERT INTO `{}` (doc, name) VALUES (JSON_OBJECT('name', ?), ?)",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(name)
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+
+    pub async fn count_rows(&self, pool: &Pool<MySql>) -> i64 {
+        MySqlSourceOps::count_rows(self, pool).await
+    }
+}
+
+#[async_trait]
+impl TestFixture for MySqlSourceJsonTrackingFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        let pool = container.create_pool().await?;
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                doc JSON NOT NULL,
+                name VARCHAR(255) NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(&pool)
+            .await
+            .map_err(|e| TestBinaryError::FixtureSetup {
+                fixture_type: "MySqlSourceJsonTrackingFixture".to_string(),
+                message: format!("Failed to create table: {e}"),
+            })?;
+        pool.close().await;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "doc".to_string());
+        envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "id".to_string());
+        envs.insert(
+            ENV_SOURCE_CUSTOM_QUERY.to_string(),
+            "SELECT * FROM $table ORDER BY id LIMIT $limit".to_string(),
         );
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
         envs.insert(

@@ -73,6 +73,17 @@ The requirement is not cosmetic: if more than `batch_size` rows share the same t
 
 For this reason a mutable, low-resolution column such as `updated_at` is **not** a safe tracking column: many rows commonly share the same second, and rows updated in place are never re-read. Capturing updates to existing rows is out of scope for polling.
 
+Every row the connector publishes has to carry a usable value for that column, because the value is the cursor. Two ways that fails, both checked on every poll and against the rows themselves, so a `custom_query` is held to them just as the built-in query is:
+
+- **The result set does not contain the column.** A query that never projects it, or projects it under another name — `SELECT id AS row_id` returns `row_id`, not `id` — leaves no row able to move the cursor, so the same result set would be published on every poll forever. The batch is rejected before anything is published and the table is **disabled until the connector restarts**: the query cannot start returning the column on its own. The error lists the columns the query did return.
+- **A row's value is NULL, or of a type with no ordered scalar form** (`tinyint(1)`, `JSON`). The batch is rejected the same way, but the table **stays enabled**, since an `UPDATE` can repair the row and the next poll will then pick it up. Until that happens the table publishes nothing and the error repeats every poll — it is a stall, not a transient.
+
+Neither case loses anything: nothing is published, no row is marked or deleted, and the stored offset does not move.
+
+At startup the connector also reads the column from `information_schema` and refuses to start if its type is `JSON` or `tinyint(1)`, whether or not a `custom_query` is set — a projection cannot change a column's type.
+
+A nullable column is refused only when the connector builds its own query. With a `custom_query` it is a warning instead, because a query moves nullability in both directions: a `LEFT JOIN` introduces NULLs into a `NOT NULL` column, `WHERE ts IS NOT NULL` removes them from a nullable one. The per-poll check above catches an actual NULL.
+
 ## Output Modes
 
 ### JSON Mode (Default)
@@ -210,9 +221,78 @@ The query runs once per entry in `tables`, so with more than one table configure
 
 A query that hardcodes its table still needs that table listed in `tables`. The list is what the connector polls — an empty list means it polls nothing — and the name is also the offset key, the input to the deterministic message ID, and the `table_name` metadata field.
 
-If the query uses `$offset`, it must be ordered by the tracking column in ascending order (`ORDER BY <tracking_column>` — MySQL sorts ascending by default, so `ASC` doesn't need to be spelled out). The connector takes the tracking value of the *last row returned* as the next `$offset`; without ascending order, that's not guaranteed to be the max, so rows can be skipped or re-emitted on the next poll.
+The query must also project `tracking_column` under exactly that name, with a non-null scalar value in every row, and should filter on `$offset` — a query that does not re-reads the same rows on every poll by design. See [Tracking Column Requirements](#tracking-column-requirements) for what happens when it does not.
+
+### Ordering is enforced
+
+If the query uses `$offset`, it must return rows ordered ascending by the tracking column (`ORDER BY <tracking_column>`; MySQL sorts ascending by default, so `ASC` doesn't need to be spelled out). The connector takes the tracking value of the *last row returned* as the next `$offset`, which is only the maximum when the batch is ascending.
+
+The connector verifies this on the rows themselves rather than by inspecting your SQL. If a row's
+tracking value is lower than the previous row's, the poll for that table is abandoned: no messages
+are published, no rows are marked or deleted, and the stored offset is not advanced.
+
+Because the same query returns the same misordered rows every cycle, the table is then **disabled
+until the connector is restarted**, and the error names the table, the tracking column, and the two
+offending values. Other configured tables keep running.
+
+The check also covers the gap between polls. A batch is compared against the offset it resumed from,
+so a batch that is ascending within itself but reaches back behind its own cursor is caught too —
+without which a `batch_size` of `1`, or any table quiet enough to yield one row per poll, would slip
+past unchecked. That case is logged and the cycle skipped, but the table stays enabled, because
+unlike a misordered query it can come from the data rather than the SQL and resolve on its own. It is
+only applied when the cursor is what limits the rows a poll can see: the built-in query always
+filters on it, a `custom_query` only if it interpolates `$offset`.
+
+When the cause *is* the query — an `$offset` filter applied to a column other than the tracking
+column, say — the warning repeats every poll and the table publishes nothing until the query is
+corrected. It is a stall, not a transient.
+
+Checking the rows rather than the query text matters, because these all *look* ordered and are not:
+
+```sql
+-- ORDER BY inside a derived table; MySQL discards it when the outer query doesn't need it
+SELECT * FROM (SELECT * FROM $table WHERE id > $offset ORDER BY id) t LIMIT $limit
+
+-- ORDER BY confined to a CTE
+WITH recent AS (SELECT * FROM $table ORDER BY id) SELECT * FROM recent LIMIT $limit
+
+-- window ordering, which does not order the result set
+SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM $table LIMIT $limit
+
+-- ascending and explicit, but by the wrong column when tracking_column is `id`
+SELECT * FROM $table WHERE id > $offset ORDER BY created_at ASC LIMIT $limit
+```
 
 The column you order by is your effective tracking column, so the same [Tracking Column Requirements](#tracking-column-requirements) apply: it must be unique and monotonically increasing, or rows sharing a value can be skipped across a batch boundary.
+
+How ordering is judged depends on the tracking column's SQL type. Offsets are carried as strings, so
+an `INT` `10` and a `VARCHAR` `"10"` are indistinguishable by content, while MySQL sorts them
+differently: numeric columns order by value (`9` before `10`), string and temporal columns order by
+collation (`"10"` before `"5"`).
+
+The type is read from the result set the query returns, which also settles it for a `custom_query`
+projecting a computed column that has no `information_schema` row of its own, and for a table that
+did not exist when the connector started. `information_schema` is still consulted at startup, for the
+`NOT NULL` and column-type checks above.
+
+For collation-ordered columns a decrease is only reported when case-sensitive and case-insensitive
+comparisons agree, since the collation itself is not known (`utf8mb4_0900_ai_ci` orders `a` before
+`B`, `utf8mb4_bin` orders `B` first). Non-ASCII values are always treated as ambiguous, because
+accent-insensitive and language-specific collations sort them in ways a byte comparison cannot
+reproduce.
+
+The type also decides how the offset is written into the query. A collation-ordered column always
+gets a quoted literal, even when its values look numeric: MySQL comparing a string column against a
+bare number converts both sides to a double, which would filter numerically while `ORDER BY` sorts by
+collation. A cursor picked from a collation-ordered batch and fed back into a numeric filter strands
+every row below the numeric high-water mark permanently, and the implicit conversion also stops the
+column's index from being used.
+
+**On upgrade:** a deployment already tracking a text column that holds digit-like values has a stored
+offset that was chosen under the old numeric comparison. The first poll after upgrading filters by
+collation instead, so rows between the collation position of that offset and the numeric high-water
+mark are read again and republished once. That is duplication, not loss, and it is within the
+[at-least-once](#delivery-semantics) contract the connector already provides, but expect the burst.
 
 Example:
 
