@@ -25,4 +25,5 @@ pub use source::{
     MySqlSourceJsonFixture, MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture,
     MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
     MySqlSourceNullTrackingFixture, MySqlSourceRawFixture, MySqlSourceTextTrackingFixture,
+    MySqlSourceTimestampDeleteFixture, MySqlSourceTimestampTrackingFixture,
 };

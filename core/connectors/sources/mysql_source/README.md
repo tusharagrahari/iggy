@@ -49,7 +49,7 @@ custom_query = "SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit
 | `connection_string` | string | required | MySQL connection string (`mysql://user:pass@host:3306/db`) |
 | `tables` | array | required | List of tables to monitor |
 | `poll_interval` | string | `10s` | How often to poll (e.g., `1s`, `5m`) |
-| `batch_size` | u32 | `1000` | Max rows per poll; must be greater than 0 |
+| `batch_size` | u32 | `1000` | Max rows per poll; must be greater than 0, and greater than 1 when `custom_query` filters on `$offset` (see [Ordering is checked on the rows](#ordering-is-checked-on-the-rows)) |
 | `tracking_column` | string | required | Column for incremental polling; must be unique and monotonically increasing (see [Tracking Column Requirements](#tracking-column-requirements)) |
 | `initial_offset` | string | none | Starting value for tracking column |
 | `max_connections` | u32 | `10` | Max database connections |
@@ -71,7 +71,7 @@ Polling is **insert-only**. Each poll runs roughly `SELECT ... WHERE tracking_co
 
 `tracking_column` is required. It is the single field that decides whether polling loses rows, and the connector cannot check the choice for you: on the built-in query it reads the column's type and nullability but not the schema's intent, and a `custom_query` is substituted as text and never parsed, so nothing can confirm that the column you named is the one the query orders by.
 
-**On upgrade:** the field used to default to `id`. A deployment that relied on that default now fails at startup with an `InitError` naming the field; add `tracking_column = "id"` to restore the previous behavior, or take the opportunity to check that `id` really is unique and monotonically increasing in the order MySQL sorts it (a `CHAR(36)` UUIDv4 `id` passes every startup check and silently drops most of the table).
+There is no default, because a wrong guess fails silently. A `CHAR(36)` column named `id` holding a UUIDv4 passes every startup check the connector can run and still drops most of the table, since v4 UUIDs are unordered and every row sorting below the stored cursor is never selected again.
 
 The requirement is not cosmetic: if more than `batch_size` rows share the same tracking value, only the first `batch_size` are read and the next poll's `>` filter skips the rest of that value permanently. The same skip applies to `processed_column` and `delete_after_read`, because the tracking filter runs before those.
 
@@ -80,7 +80,7 @@ For this reason a mutable, low-resolution column such as `updated_at` is **not**
 Every row the connector publishes has to carry a usable value for that column, because the value is the cursor. Two ways that fails, both checked on every poll and against the rows themselves, so a `custom_query` is held to them just as the built-in query is:
 
 - **The result set does not contain the column.** A query that never projects it, or projects it under another name — `SELECT id AS row_id` returns `row_id`, not `id` — leaves no row able to move the cursor, so the same result set would be published on every poll forever. The batch is rejected before anything is published and the table is **disabled until the connector restarts**: the query cannot start returning the column on its own. The error lists the columns the query did return.
-- **A row's value is NULL, or of a type with no ordered scalar form** (`tinyint(1)`, `JSON`). The batch is rejected the same way, but the table **stays enabled**, since an `UPDATE` can repair the row and the next poll will then pick it up. Until that happens the table publishes nothing and the error repeats every poll — it is a stall, not a transient.
+- **A row's value is NULL, or has no ordered scalar form.** Past the startup type gate below, the second reaches you only via a `custom_query` whose aliased expression yields a boolean or a JSON document, invisible to `information_schema`. The batch is rejected the same way, but the table **stays enabled**, since an `UPDATE` can repair the row and the next poll will then pick it up. Until that happens the table publishes nothing and the error repeats every poll — it is a stall, not a transient.
 
 Neither of the two loses anything: nothing is published, no row is marked or deleted, and the stored offset does not move.
 
@@ -88,7 +88,8 @@ The name is matched the way MySQL matches identifiers, case-insensitively, so `t
 
 At startup the connector also reads the column from `information_schema` and refuses to start on a type that cannot carry a cursor, whether or not a `custom_query` is set — a projection cannot change a column's type. Rejected types and why:
 
-- `JSON` and `tinyint(1)` have no ordered scalar form, so no row would ever produce a cursor.
+- `JSON` has no ordered scalar form, so no row would ever produce a cursor.
+- `TINYINT` holds at most 256 distinct values, which cannot be unique per row, and at display width 1 MySQL spells the type `BOOLEAN`, which reaches the connector as `true`/`false` with no ordered scalar form at all. The whole family is refused rather than the `tinyint(1)` spelling alone, because MySQL 8.0.19 and later drop the display width for unsigned columns while MariaDB keeps it, so the declared type cannot be trusted to reveal which case it is.
 - `BINARY`, `VARBINARY` and the `BLOB` family are carried as base64 text, which does not order the way the underlying bytes do. The cursor would be compared in one order while `ORDER BY` used another, and the base64 literal would be compared against raw bytes. `BINARY(16)` UUID keys are the common case here; track an auto-increment key or a `CHAR(36)` column instead.
 - `ENUM` and `SET` are sorted by MySQL on declaration index, not on the label the connector sees, so the two disagree whenever the members are not declared in alphabetical order. A bounded set of labels cannot be unique per row either.
 
@@ -233,7 +234,7 @@ A query that hardcodes its table still needs that table listed in `tables`. The 
 
 The query must also project `tracking_column` under exactly that name, with a non-null scalar value in every row, and should filter on `$offset` — a query that does not re-reads the same rows on every poll by design. See [Tracking Column Requirements](#tracking-column-requirements) for what happens when it does not.
 
-### Ordering is enforced
+### Ordering is checked on the rows
 
 If the query uses `$offset`, it must return rows ordered ascending by the tracking column (`ORDER BY <tracking_column>`; MySQL sorts ascending by default, so `ASC` doesn't need to be spelled out). The connector takes the tracking value of the *last row returned* as the next `$offset`, which is only the maximum when the batch is ascending.
 
@@ -246,12 +247,26 @@ until the connector is restarted**, and the error names the table, the tracking 
 offending values. Other configured tables keep running.
 
 The check also covers the gap between polls. A batch is compared against the offset it resumed from,
-so a batch that is ascending within itself but reaches back behind its own cursor is caught too —
-without which a `batch_size` of `1`, or any table quiet enough to yield one row per poll, would slip
-past unchecked. That case is logged and the cycle skipped, but the table stays enabled, because
-unlike a misordered query it can come from the data rather than the SQL and resolve on its own. It is
-only applied when the cursor is what limits the rows a poll can see: the built-in query always
-filters on it, a `custom_query` only if it interpolates `$offset`.
+so a batch that is ascending within itself but reaches back behind its own cursor is caught too. That
+case is logged and the cycle skipped, but the table stays enabled, because unlike a misordered query
+it can come from the data rather than the SQL and resolve on its own. It is only applied when the
+cursor is what limits the rows a poll can see: the built-in query always filters on it, a
+`custom_query` only if it interpolates `$offset`.
+
+That comparison against the resume cursor is the whole of what a batch of one row can be judged on,
+and it only catches a row reaching *behind* the cursor. A row above it is indistinguishable from
+progress. So a `$offset` query ordered descending at `batch_size = 1` accepts the highest row on
+every poll, walks the cursor to the table's maximum, and skips every row in between with nothing
+reporting it. No row-level check can see that, so the connector refuses the combination at startup:
+`batch_size = 1` together with a `custom_query` containing `$offset` is an `InitError`. An ascending
+query is rejected the same way, since the connector never parses the SQL and cannot tell the two
+apart. The built-in query is unaffected, because the connector writes its `ORDER BY` itself, and
+`batch_size = 1` there is safe.
+
+That startup check can only see the limit the connector supplies. A `custom_query` that writes
+`LIMIT 1` itself instead of interpolating `$limit` has the same failure at any `batch_size`, and
+nothing detects it — the query text is substituted, never parsed. Interpolate `$limit` so the
+configured `batch_size` is the one that applies.
 
 When the cause *is* the query — an `$offset` filter applied to a column other than the tracking
 column, say — the warning repeats every poll and the table publishes nothing until the query is
@@ -306,12 +321,6 @@ collation. A cursor picked from a collation-ordered batch and fed back into a nu
 every row below the numeric high-water mark permanently, and the implicit conversion also stops the
 column's index from being used.
 
-**On upgrade:** a deployment already tracking a text column that holds digit-like values has a stored
-offset that was chosen under the old numeric comparison. The first poll after upgrading filters by
-collation instead, so rows between the collation position of that offset and the numeric high-water
-mark are read again and republished once. That is duplication, not loss, and it is within the
-[at-least-once](#delivery-semantics) contract the connector already provides, but expect the burst.
-
 Example:
 
 ```sql
@@ -321,6 +330,20 @@ WHERE id > $offset
 ORDER BY id
 LIMIT $limit
 ```
+
+A `TIMESTAMP` column is the one case where the value the connector puts back into SQL is not
+rendered the way the published payload is. It is the only temporal type that arrives as a zoned
+instant, so its natural rendering ends in a `UTC` suffix, and MySQL reads that literal only by
+parsing the part it recognises and complaining about the rest. In a `SELECT` that is a warning; in
+the `DELETE` or `UPDATE` that
+[delete_after_read / processed_column](#delete-after-read--mark-as-processed) issues it is an
+**error** under the default `STRICT_TRANS_TABLES`, which aborts the statement. So the cursor and the
+primary-key binding are both written as `YYYY-MM-DD HH:MM:SS.ffffff`, which MySQL parses exactly and
+which compares correctly as text at fixed width. Only the payload carries the zoned rendering.
+
+This is reachable whenever `primary_key_column` is left unset, since it then defaults to
+`tracking_column`: a `TIMESTAMP` tracking column with `delete_after_read` or `processed_column` is
+exactly the shape that binds a timestamp into that predicate.
 
 ## Delete After Read / Mark as Processed
 
@@ -389,7 +412,8 @@ The connector handles these MySQL types in JSON mode:
 | `YEAR` | number (u16 → u64) |
 | `DATE` | string (YYYY-MM-DD) |
 | `TIME` | string (HH:MM:SS) |
-| `DATETIME`, `TIMESTAMP` | string (YYYY-MM-DD HH:MM:SS) |
+| `DATETIME` | string (YYYY-MM-DD HH:MM:SS[.ffffff]) |
+| `TIMESTAMP` | string (YYYY-MM-DD HH:MM:SS[.ffffff] UTC) |
 | `CHAR`, `VARCHAR`, `TINYTEXT`, `TEXT`, `MEDIUMTEXT`, `LONGTEXT` | string |
 | `ENUM`, `SET` | string |
 | `BINARY`, `VARBINARY`, `TINYBLOB`, `BLOB`, `MEDIUMBLOB`, `LONGBLOB` | base64 string |
@@ -397,6 +421,8 @@ The connector handles these MySQL types in JSON mode:
 | `NULL` | null |
 | Unknown | string (text fallback), or base64 string (binary fallback) |
 
+> **TIMESTAMP suffix:** `TIMESTAMP` is the only type that reaches the payload with a zone suffix, because it is the only one that arrives as a zoned value rather than a naive one. The cursor and the primary-key binding are written without it (see [Tracking Column Requirements](#tracking-column-requirements)); the suffix is the payload's alone.
+>
 > **DECIMAL precision:** MySQL `DECIMAL` is an arbitrary-precision decimal type. The connector emits it as a JSON string verbatim (e.g. `"99999999999999999"`), preserving the exact value. Parse it as a decimal in the consumer if you need to do arithmetic; do not assume it arrives as a JSON number.
 
 ## Reliability Features

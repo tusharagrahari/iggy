@@ -169,7 +169,7 @@ fn offset_kind_for_type_name(type_name: &str) -> OffsetKind {
     }
 }
 
-fn unusable_tracking_type(data_type: &str, column_type: &str) -> Option<&'static str> {
+fn unusable_tracking_type(data_type: &str) -> Option<&'static str> {
     const BINARY: &[&str] = &[
         "binary",
         "varbinary",
@@ -179,8 +179,18 @@ fn unusable_tracking_type(data_type: &str, column_type: &str) -> Option<&'static
         "longblob",
     ];
 
-    if data_type.eq_ignore_ascii_case("json") || column_type.eq_ignore_ascii_case("tinyint(1)") {
+    if data_type.eq_ignore_ascii_case("json") {
         return Some("it yields no ordered scalar cursor");
+    }
+    // Judged on `data_type` rather than on the `tinyint(1)` display width that spells
+    // BOOLEAN, because that width is not reliably reported: MySQL 8.0.19 and later drop
+    // it for unsigned columns while MariaDB keeps it.
+    if data_type.eq_ignore_ascii_case("tinyint") {
+        return Some(
+            "at most 256 distinct values cannot be unique per row, and at display width 1 MySQL \
+             spells the type BOOLEAN, which reaches the connector as true/false with no ordered \
+             scalar form",
+        );
     }
     if BINARY
         .iter()
@@ -392,6 +402,25 @@ impl Source for MySqlSource {
         if self.config.batch_size == Some(0) {
             return Err(Error::InitError(
                 "batch_size must be greater than 0; omit it to use the default of 1000".to_string(),
+            ));
+        }
+
+        // Only when the operator owns the ORDER BY. The built query sorts ascending by
+        // construction, so a one-row batch is safe there and legitimate for a slow table.
+        if self.config.batch_size == Some(1)
+            && self
+                .config
+                .custom_query
+                .as_deref()
+                .is_some_and(|query| query.contains("$offset"))
+        {
+            return Err(Error::InitError(
+                "batch_size must be greater than 1 when custom_query filters on $offset: a \
+                 one-row batch offers no pair to compare, so the ordering check reduces to \
+                 the row against the offset it resumed from, and a query ordered descending \
+                 opens above that offset on every poll. The cursor would walk to the table's \
+                 maximum and skip every row below it with nothing reporting it"
+                    .to_string(),
             ));
         }
 
@@ -690,7 +719,7 @@ impl MySqlSource {
             // The column's type survives a plain projection, so it is worth rejecting
             // whatever the query looks like. A custom_query aliasing an expression onto
             // a name the table also uses is the one false positive, hence the hint.
-            if let Some(reason) = unusable_tracking_type(&data_type, &column_type) {
+            if let Some(reason) = unusable_tracking_type(&data_type) {
                 let aliasing_hint = if self.config.custom_query.is_some() {
                     " If custom_query aliases a different expression to this name, rename the \
                       alias so it does not collide with the column."
@@ -1305,7 +1334,8 @@ impl MySqlSource {
                         Some(self.extract_payload_column(row, i, config.payload_format)?);
                 }
                 if name.eq_ignore_ascii_case(config.tracking_column) {
-                    tracking_value = value_as_string(&extract_column_value(row, i)?);
+                    let value = extract_column_value(row, i)?;
+                    tracking_value = column_value_as_string(row, i, &value)?;
                 }
                 if name.eq_ignore_ascii_case(config.pk_column) {
                     row_pk = extract_pk_value(row, i)?;
@@ -1340,7 +1370,7 @@ impl MySqlSource {
             };
             let value = extract_column_value(row, i)?;
             if name.eq_ignore_ascii_case(config.tracking_column) {
-                tracking_value = value_as_string(&value);
+                tracking_value = column_value_as_string(row, i, &value)?;
             }
             if name.eq_ignore_ascii_case(config.pk_column) {
                 row_pk = extract_pk_value(row, i)?;
@@ -1383,8 +1413,8 @@ impl MySqlSource {
 /// Type-faithful primary-key extraction. Binary columns are taken as raw bytes
 /// rather than routed through the base64 path in `extract_column_value`, so the
 /// value can be bound back into `WHERE pk IN (...)` and match the row. Everything
-/// else reuses the scalar string form, which MySQL implicitly converts. Returns
-/// None only for a NULL pk, which a real primary key cannot be.
+/// else takes the string form MySQL parses back to the same value. Returns None
+/// only for a NULL pk, which a real primary key cannot be.
 fn extract_pk_value(row: &MySqlRow, column_index: usize) -> Result<Option<PkValue>, Error> {
     let column = &row.columns()[column_index];
     let type_name = column.type_info().name();
@@ -1398,7 +1428,10 @@ fn extract_pk_value(row: &MySqlRow, column_index: usize) -> Result<Option<PkValu
             })?;
             Ok(bytes.map(PkValue::Bytes))
         }
-        _ => Ok(value_as_string(&extract_column_value(row, column_index)?).map(PkValue::Text)),
+        _ => {
+            let value = extract_column_value(row, column_index)?;
+            Ok(column_value_as_string(row, column_index, &value)?.map(PkValue::Text))
+        }
     }
 }
 
@@ -1592,6 +1625,37 @@ fn value_as_string(value: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// The string form of a column value that MySQL parses back to the value it came
+/// from, which for `TIMESTAMP` is not its payload form: that one carries chrono's
+/// trailing ` UTC`. A `SELECT` only warns about the superfluous delimiter, but the
+/// same conversion inside the mark/delete DML is an error under the default
+/// `STRICT_TRANS_TABLES`, so both the cursor and the `WHERE pk IN (...)` binding
+/// take this form. Only the payload keeps chrono's rendering.
+fn column_value_as_string(
+    row: &MySqlRow,
+    column_index: usize,
+    value: &serde_json::Value,
+) -> Result<Option<String>, Error> {
+    let column = &row.columns()[column_index];
+    if column.type_info().name() != "TIMESTAMP" {
+        return Ok(value_as_string(value));
+    }
+
+    let timestamp: Option<DateTime<Utc>> = row.try_get(column_index).map_err(|e| {
+        Error::InvalidRecordValue(format!(
+            "tracking column '{}' (MySQL type 'TIMESTAMP'): {e}",
+            column.name()
+        ))
+    })?;
+    Ok(timestamp.map(timestamp_cursor))
+}
+
+/// Fixed width, so the collation comparison a temporal cursor is ordered by agrees
+/// with the instants the values stand for.
+fn timestamp_cursor(timestamp: DateTime<Utc>) -> String {
+    timestamp.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+}
+
 fn build_processed_row(
     table: &str,
     payload: Vec<u8>,
@@ -1599,6 +1663,10 @@ fn build_processed_row(
     row_pk: Option<PkValue>,
 ) -> ProcessedRow {
     let now = Utc::now().timestamp_micros() as u64;
+    // The key is the pk's string form, so changing how a column type renders re-keys
+    // every row of that type. Once connectors are in the field that breaks dedup for
+    // any row replayed across the change, so weigh it before touching
+    // `column_value_as_string`.
     let pk_key = row_pk.as_ref().map(PkValue::as_key);
     let id = message_id(table, pk_key.as_deref().or(tracking_value.as_deref()));
     ProcessedRow {
@@ -2357,6 +2425,43 @@ mod tests {
     }
 
     #[test]
+    fn given_single_row_batches_under_an_offset_filtered_custom_query_should_fail_open() {
+        // With one row per batch the ordering check has only the resume cursor to
+        // compare against, and a descending $offset query opens above that cursor on
+        // every poll, so the rows it skips are never seen by anything.
+        let mut config = test_config();
+        config.batch_size = Some(1);
+        config.custom_query =
+            Some("SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit".to_string());
+        let mut source = MySqlSource::new(1, config, None);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(source.open());
+        assert!(
+            matches!(result, Err(Error::InitError(ref message)) if message.contains("batch_size")),
+            "expected an InitError naming batch_size, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn given_single_row_batches_on_the_built_query_should_pass_the_batch_size_gate() {
+        // The connector writes that query's ORDER BY itself, so one row per batch is
+        // safe there and legitimate for a slow table. `payload_column` is set to trip
+        // the next gate, which keeps the assertion off the network.
+        let mut config = test_config();
+        config.batch_size = Some(1);
+        config.payload_column = Some("data".to_string());
+        let mut source = MySqlSource::new(1, config, None);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = runtime.block_on(source.open());
+        assert!(
+            matches!(result, Err(Error::InitError(ref message)) if message.contains("payload_format")),
+            "batch_size 1 must survive the gate without an $offset custom_query, got {result:?}"
+        );
+    }
+
+    #[test]
     fn given_empty_tables_should_fail_open() {
         // Every poll iterates `tables`, so an empty list would leave the connector
         // running and producing nothing instead of reporting the misconfiguration.
@@ -2631,42 +2736,43 @@ mod tests {
 
     #[test]
     fn given_declared_type_without_a_usable_cursor_should_be_rejected() {
-        // Each family for a different reason: no scalar form at all, base64 text that
-        // does not order like the bytes it stands for, and labels MySQL sorts by
-        // declaration index instead.
-        for (data_type, column_type) in [
-            ("json", "json"),
-            ("tinyint", "tinyint(1)"),
-            ("binary", "binary(16)"),
-            ("varbinary", "varbinary(255)"),
-            ("blob", "blob"),
-            ("longblob", "longblob"),
-            ("enum", "enum('new','done')"),
-            ("set", "set('a','b')"),
+        // Each family for a different reason: no scalar form at all, a domain too small
+        // to hold one value per row, base64 text that does not order like the bytes it
+        // stands for, and labels MySQL sorts by declaration index instead. The whole
+        // `data_type` decides it, so a `tinyint(1) unsigned` that MariaDB reports with
+        // its width and MySQL 8.0.19+ reports without one is rejected either way.
+        for data_type in [
+            "json",
+            "tinyint",
+            "TINYINT",
+            "binary",
+            "varbinary",
+            "blob",
+            "longblob",
+            "enum",
+            "set",
         ] {
             assert!(
-                unusable_tracking_type(data_type, column_type).is_some(),
-                "{column_type} cannot carry a cursor and must be rejected"
+                unusable_tracking_type(data_type).is_some(),
+                "{data_type} cannot carry a cursor and must be rejected"
             );
         }
     }
 
     #[test]
     fn given_declared_type_with_a_usable_cursor_should_be_accepted() {
-        // tinyint is rejected only at display width 1, which is how MySQL spells
-        // BOOLEAN; a plain tinyint still orders numerically.
-        for (data_type, column_type) in [
-            ("int", "int"),
-            ("bigint", "bigint unsigned"),
-            ("tinyint", "tinyint(4)"),
-            ("varchar", "varchar(64)"),
-            ("timestamp", "timestamp"),
-            ("decimal", "decimal(20,4)"),
+        for data_type in [
+            "int",
+            "bigint",
+            "smallint",
+            "varchar",
+            "timestamp",
+            "decimal",
         ] {
             assert_eq!(
-                unusable_tracking_type(data_type, column_type),
+                unusable_tracking_type(data_type),
                 None,
-                "{column_type} should be accepted as a tracking column"
+                "{data_type} should be accepted as a tracking column"
             );
         }
     }
@@ -2798,13 +2904,37 @@ mod tests {
     }
 
     #[test]
-    fn given_single_row_batches_should_still_catch_a_descending_query() {
-        // Without the resume cursor a one-row batch has no pair to compare, so
-        // batch_size=1 (or any slow table yielding a row per poll) would walk a
-        // DESC query straight past the guard.
+    fn given_a_single_row_below_its_resume_cursor_should_be_rejected() {
+        // The only pair a one-row batch offers is the row against the cursor it
+        // resumed from, so that is the whole of what the seed adds: a row reaching
+        // behind the cursor. A row above it is indistinguishable from progress, which
+        // is why a DESC query filtered on $offset walks past at batch_size=1.
         assert!(run_guard("id", OffsetKind::Numeric, &["30"]).is_ok());
+        assert!(resume_guard("id", OffsetKind::Numeric, Some("30"), &["40"]).is_ok());
         let error = resume_guard("id", OffsetKind::Numeric, Some("30"), &["20"]).unwrap_err();
         assert!(error.starts_with("below_cursor:"), "{error}");
+    }
+
+    #[test]
+    fn given_timestamp_tracking_value_should_render_a_cursor_without_a_zone_suffix() {
+        // chrono renders DateTime<Utc> as "... UTC", which MySQL accepts only by
+        // prefix-parsing and warns is a deprecated delimiter. Fixed-width fractional
+        // digits keep the collation comparison the cursor is ordered by agreeing with
+        // the instants.
+        let whole_second = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let fractional = DateTime::from_timestamp(1_700_000_000, 500_000_000).unwrap();
+        assert_eq!(timestamp_cursor(whole_second), "2023-11-14 22:13:20.000000");
+        assert_eq!(timestamp_cursor(fractional), "2023-11-14 22:13:20.500000");
+        assert!(!offset_decreased(
+            &timestamp_cursor(whole_second),
+            &timestamp_cursor(fractional),
+            OffsetKind::Lexical
+        ));
+        assert!(offset_decreased(
+            &timestamp_cursor(fractional),
+            &timestamp_cursor(whole_second),
+            OffsetKind::Lexical
+        ));
     }
 
     #[test]

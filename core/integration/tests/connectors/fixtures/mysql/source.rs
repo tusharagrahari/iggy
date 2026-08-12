@@ -1195,6 +1195,228 @@ impl TestFixture for MySqlSourceNullTrackingFixture {
     }
 }
 
+/// MySQL source fixture whose tracking column is a `TIMESTAMP`.
+///
+/// `TIMESTAMP` is the one temporal type sqlx decodes into `DateTime<Utc>`, whose
+/// display appends a ` UTC` no other column type carries. `DATETIME` decodes into
+/// `NaiveDateTime` and renders without a suffix, which is why every other temporal
+/// fixture here misses this path: the two are one keyword apart.
+///
+/// MySQL prefix-parses that suffix in a `SELECT`, so resuming works whichever way
+/// the cursor is rendered and this fixture cannot discriminate that fix. It covers
+/// the payload rendering, which must not move when the cursor rendering does, and
+/// `TIMESTAMP` tracking working across a cursor boundary at all. The rendering that
+/// only a `DELETE` can tell apart is covered by
+/// `MySqlSourceTimestampDeleteFixture`.
+pub struct MySqlSourceTimestampTrackingFixture {
+    container: MySqlContainer,
+}
+
+impl MySqlOps for MySqlSourceTimestampTrackingFixture {
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl MySqlSourceOps for MySqlSourceTimestampTrackingFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl MySqlSourceTimestampTrackingFixture {
+    const TABLE: &'static str = "test_timestamp_tracking";
+    /// Any fixed point inside the `TIMESTAMP` range. Rows take `EPOCH + sequence`
+    /// so their tracking values are distinct and ascending without depending on
+    /// insert timing, which whole-second resolution would otherwise collide on.
+    const EPOCH: i64 = 1_700_000_000;
+    /// Below every row and non-numeric, which the config env provider requires: it
+    /// types a bare number and then fails to deserialize it into the string field.
+    const INITIAL_OFFSET: &'static str = "2000-01-01 00:00:00";
+
+    pub async fn create_table(&self, pool: &Pool<MySql>) {
+        // NOT NULL is explicit because `explicit_defaults_for_timestamp` (ON since
+        // MySQL 8.0) makes a bare TIMESTAMP nullable, which the built-query path
+        // refuses. No ON UPDATE clause either: a value that moves under the cursor
+        // is the mutable-column case the connector documents as unsupported.
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                updated_at TIMESTAMP(6) NOT NULL,
+                name VARCHAR(255) NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+
+    pub async fn insert_row(&self, pool: &Pool<MySql>, sequence: i64, name: &str) {
+        let query = format!(
+            "INSERT INTO `{}` (updated_at, name) VALUES (FROM_UNIXTIME(?), ?)",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(Self::EPOCH + sequence)
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+
+    pub async fn count_rows(&self, pool: &Pool<MySql>) -> i64 {
+        MySqlSourceOps::count_rows(self, pool).await
+    }
+}
+
+#[async_trait]
+impl TestFixture for MySqlSourceTimestampTrackingFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(
+            ENV_SOURCE_TRACKING_COLUMN.to_string(),
+            "updated_at".to_string(),
+        );
+        envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "id".to_string());
+        envs.insert(
+            ENV_SOURCE_INITIAL_OFFSET.to_string(),
+            Self::INITIAL_OFFSET.to_string(),
+        );
+        envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            ENV_SOURCE_PLUGIN_PATH.to_string(),
+        );
+        envs
+    }
+}
+
+/// MySQL source fixture that deletes rows keyed by a `TIMESTAMP` tracking column.
+///
+/// `primary_key_column` is deliberately unset so it defaults to `tracking_column`,
+/// which is the configuration that sends a `TIMESTAMP` value into the mark/delete
+/// `WHERE pk IN (...)`. That predicate runs inside DML, where the default
+/// `STRICT_TRANS_TABLES` turns a datetime conversion that a `SELECT` only warns
+/// about into a hard error, so a value rendered with a zone suffix fails the
+/// statement outright and the batch is never published.
+pub struct MySqlSourceTimestampDeleteFixture {
+    container: MySqlContainer,
+}
+
+impl MySqlOps for MySqlSourceTimestampDeleteFixture {
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl MySqlSourceOps for MySqlSourceTimestampDeleteFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl MySqlSourceTimestampDeleteFixture {
+    const TABLE: &'static str = "test_timestamp_delete";
+    const EPOCH: i64 = 1_700_000_000;
+    const INITIAL_OFFSET: &'static str = "2000-01-01 00:00:00";
+
+    pub async fn create_table(&self, pool: &Pool<MySql>) {
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                updated_at TIMESTAMP(6) NOT NULL,
+                name VARCHAR(255) NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to create table: {e}"));
+    }
+
+    pub async fn insert_row(&self, pool: &Pool<MySql>, sequence: i64, name: &str) {
+        let query = format!(
+            "INSERT INTO `{}` (updated_at, name) VALUES (FROM_UNIXTIME(?), ?)",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(Self::EPOCH + sequence)
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+
+    pub async fn count_rows(&self, pool: &Pool<MySql>) -> i64 {
+        MySqlSourceOps::count_rows(self, pool).await
+    }
+}
+
+#[async_trait]
+impl TestFixture for MySqlSourceTimestampDeleteFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(
+            ENV_SOURCE_TRACKING_COLUMN.to_string(),
+            "updated_at".to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_INITIAL_OFFSET.to_string(),
+            Self::INITIAL_OFFSET.to_string(),
+        );
+        envs.insert(ENV_SOURCE_DELETE_AFTER_READ.to_string(), "true".to_string());
+        envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            ENV_SOURCE_PLUGIN_PATH.to_string(),
+        );
+        envs
+    }
+}
+
 /// MySQL source fixture whose tracking column is a `JSON` column, with a
 /// `custom_query` set.
 ///

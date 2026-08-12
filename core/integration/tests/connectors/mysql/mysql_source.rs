@@ -23,12 +23,14 @@ use crate::connectors::fixtures::{
     MySqlSourceJsonFixture, MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture,
     MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
     MySqlSourceNullTrackingFixture, MySqlSourceOps, MySqlSourceRawFixture,
-    MySqlSourceTextTrackingFixture,
+    MySqlSourceTextTrackingFixture, MySqlSourceTimestampDeleteFixture,
+    MySqlSourceTimestampTrackingFixture,
 };
 use iggy_common::MessageClient;
 use iggy_common::{Consumer, Identifier, IggyTimestamp, PollingStrategy};
 use integration::harness::seeds;
 use integration::iggy_harness;
+use std::collections::BTreeSet;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -1099,6 +1101,205 @@ async fn null_tracking_value_publishes_nothing_until_the_row_is_repaired(
     assert_eq!(
         remaining, TEST_MESSAGE_COUNT as i64,
         "Expected all {TEST_MESSAGE_COUNT} rows to remain in MySQL, found {remaining}"
+    );
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn timestamp_tracking_column_resumes_from_the_cursor_it_published(
+    harness: &TestHarness,
+    fixture: MySqlSourceTimestampTrackingFixture,
+) {
+    // MySQL prefix-parses the ` UTC` a TIMESTAMP cursor used to carry, so the second
+    // wave arrives whichever way the connector renders it and this test does not
+    // discriminate that fix: the DML path in
+    // `timestamp_primary_key_deletes_the_rows_it_published` does. What is pinned here
+    // is the payload keeping chrono's own rendering, trailing zone and all, since that
+    // is the published wire format and must not move when the cursor rendering does,
+    // plus TIMESTAMP tracking carrying across a cursor boundary at all.
+    let client = harness.root_client().await.unwrap();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    for i in 0..TEST_MESSAGE_COUNT {
+        fixture
+            .insert_row(&pool, i as i64, &format!("row_{i}"))
+            .await;
+    }
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "timestamp_tracking_consumer".try_into().unwrap();
+
+    let mut received: Vec<serde_json::Value> = Vec::new();
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            for msg in polled.messages {
+                if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                    if let Some(name) = record["data"]["name"].as_str() {
+                        names.insert(name.to_string());
+                    }
+                    received.push(record);
+                }
+            }
+        }
+        if names.len() >= TEST_MESSAGE_COUNT {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+    assert_eq!(
+        names.len(),
+        TEST_MESSAGE_COUNT,
+        "Expected the first {TEST_MESSAGE_COUNT} rows before the cursor is exercised, got {names:?}"
+    );
+
+    // Every one of these sits above the cursor the first wave left behind, so they
+    // are reachable only through the offset literal the connector wrote from it.
+    for i in TEST_MESSAGE_COUNT..TEST_MESSAGE_COUNT * 2 {
+        fixture
+            .insert_row(&pool, i as i64, &format!("row_{i}"))
+            .await;
+    }
+
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            for msg in polled.messages {
+                if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&msg.payload) {
+                    if let Some(name) = record["data"]["name"].as_str() {
+                        names.insert(name.to_string());
+                    }
+                    received.push(record);
+                }
+            }
+        }
+        if names.len() >= TEST_MESSAGE_COUNT * 2 {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    let remaining = fixture.count_rows(&pool).await;
+    pool.close().await;
+
+    // Counting distinct rows rather than messages: delivery is at-least-once, so a
+    // replay is allowed, but a row stranded below a cursor that did not parse is not.
+    assert_eq!(
+        names.len(),
+        TEST_MESSAGE_COUNT * 2,
+        "Expected every row across the cursor boundary, got {names:?}"
+    );
+    assert_eq!(
+        remaining,
+        (TEST_MESSAGE_COUNT * 2) as i64,
+        "Expected all {} rows to remain in MySQL, found {remaining}",
+        TEST_MESSAGE_COUNT * 2
+    );
+
+    for (i, record) in received.iter().enumerate() {
+        let updated_at = record["data"]["updated_at"]
+            .as_str()
+            .unwrap_or_else(|| panic!("record {i} carries no updated_at: {record}"));
+        assert!(
+            updated_at.ends_with(" UTC"),
+            "record {i} published '{updated_at}': the payload rendering is the wire format \
+             every existing deployment already parses, and only the cursor changes"
+        );
+    }
+}
+
+#[iggy_harness(
+    server(connectors_runtime(config_path = "tests/connectors/mysql/source.toml")),
+    seed = seeds::connector_stream
+)]
+async fn timestamp_primary_key_deletes_the_rows_it_published(
+    harness: &TestHarness,
+    fixture: MySqlSourceTimestampDeleteFixture,
+) {
+    // `primary_key_column` defaults to `tracking_column`, so this config binds a
+    // TIMESTAMP into the delete predicate. That predicate runs inside DML, where the
+    // default STRICT_TRANS_TABLES turns a datetime conversion the SELECT path only
+    // warns about into a hard error: the delete fails, the batch is dropped before
+    // publishing, the offset stays put, and the same rows retry every poll. Nothing
+    // arriving and nothing being deleted are the same failure here.
+    let client = harness.root_client().await.unwrap();
+    let pool = fixture.create_pool().await.expect("Failed to create pool");
+    fixture.create_table(&pool).await;
+
+    for i in 0..TEST_MESSAGE_COUNT {
+        fixture
+            .insert_row(&pool, i as i64, &format!("row_{i}"))
+            .await;
+    }
+
+    let stream_id: Identifier = seeds::names::STREAM.try_into().unwrap();
+    let topic_id: Identifier = seeds::names::TOPIC.try_into().unwrap();
+    let consumer_id: Identifier = "timestamp_delete_consumer".try_into().unwrap();
+
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for _ in 0..POLL_ATTEMPTS {
+        if let Ok(polled) = client
+            .poll_messages(
+                &stream_id,
+                &topic_id,
+                None,
+                &Consumer::new(consumer_id.clone()),
+                &PollingStrategy::next(),
+                10,
+                true,
+            )
+            .await
+        {
+            for msg in polled.messages {
+                if let Ok(record) = serde_json::from_slice::<serde_json::Value>(&msg.payload)
+                    && let Some(name) = record["data"]["name"].as_str()
+                {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+        if names.len() >= TEST_MESSAGE_COUNT {
+            break;
+        }
+        sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+
+    let remaining = fixture.count_rows(&pool).await;
+    pool.close().await;
+
+    assert_eq!(
+        names.len(),
+        TEST_MESSAGE_COUNT,
+        "Expected every row to be published, got {names:?}"
+    );
+    assert_eq!(
+        remaining, 0,
+        "Expected the published rows to be deleted by their TIMESTAMP key, {remaining} remain"
     );
 }
 
