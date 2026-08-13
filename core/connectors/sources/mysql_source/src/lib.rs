@@ -277,18 +277,14 @@ fn observed_tracking_kind(row: &MySqlRow, tracking_column: &str) -> Option<Offse
         .filter(|kind| *kind != OffsetKind::Unknown)
 }
 
-/// The result set's column names. A result set carries one column list for all of its
-/// rows, so any row answers for the batch.
-fn projected_columns(row: &MySqlRow) -> Vec<&str> {
-    row.columns().iter().map(|column| column.name()).collect()
-}
-
-fn ensure_tracking_column_projected(
-    projected: &[&str],
+/// `Clone` so the passing case, which is every batch, walks the names without collecting.
+fn ensure_tracking_column_projected<'a>(
+    projected: impl IntoIterator<Item = &'a str> + Clone,
     tracking_column: &str,
 ) -> Result<(), FetchError> {
     if projected
-        .iter()
+        .clone()
+        .into_iter()
         .any(|column| column.eq_ignore_ascii_case(tracking_column))
     {
         return Ok(());
@@ -297,9 +293,10 @@ fn ensure_tracking_column_projected(
         "the result set has no column '{tracking_column}', it returned [{}]. Every row's cursor \
          comes from that column, so the same rows would be re-published on every poll while the \
          stored offset never moved.",
-        projected.join(", ")
+        projected.into_iter().collect::<Vec<_>>().join(", ")
     )))
 }
+
 fn unusable_tracking_value(tracking_column: &str, pk: &str) -> FetchError {
     FetchError::UnusableTrackingValue(format!(
         "row (pk {pk}) has no usable value for tracking_column '{tracking_column}': it is NULL, or \
@@ -1196,10 +1193,16 @@ impl MySqlSource {
                     batches.push(batch);
                 }
                 Err(FetchError::Ordering(reason) | FetchError::MissingTrackingColumn(reason)) => {
+                    let remedy = if self.config.custom_query.is_some() {
+                        "with a corrected query"
+                    } else {
+                        "with a corrected tracking_column, since the connector wrote this query \
+                         itself"
+                    };
                     error!(
                         "Table '{table}' at offset {}: {reason} No rows were published and the \
                          offset was not advanced. This is deterministic, so the table is disabled \
-                         until the connector is restarted with a corrected query.",
+                         until the connector is restarted {remedy}.",
                         last_offset.as_deref().unwrap_or("<start>")
                     );
                     newly_poisoned.push(table.clone());
@@ -1391,7 +1394,10 @@ impl MySqlSource {
         // Settled once for the whole batch rather than per row, since the column list
         // is a property of the result set.
         if let Some(first) = rows.first() {
-            ensure_tracking_column_projected(&projected_columns(first), tracking_column)?;
+            ensure_tracking_column_projected(
+                first.columns().iter().map(|column| column.name()),
+                tracking_column,
+            )?;
         }
 
         let resume_from = if self.cursor_gates_query() {
@@ -1918,18 +1924,12 @@ fn quote_qualified_identifier(name: &str) -> Result<String, Error> {
     Ok(parts?.join("."))
 }
 
-/// Renders the cursor as a SQL literal. The column's kind decides the quoting, not
-/// the value's text: MySQL comparing a string column against a bare numeric literal
-/// converts both sides to double, so `code > 42` on a `VARCHAR` filters numerically
-/// while `ORDER BY code` sorts by collation. The cursor is then picked from a
-/// collation-ordered batch and fed back into a numeric filter, which strands every
-/// row whose numeric value sits below the numeric high-water mark - permanently,
-/// however far its collation order says it should still be read. Quoting also keeps
-/// the column's index usable, since the implicit cast forces a full scan.
+/// Renders the cursor as a SQL literal, quoted by the column's kind rather than by the
+/// value's text: MySQL compares a string column against a bare numeric literal as
+/// doubles, so `code > 42` on a `VARCHAR` filters numerically while `ORDER BY code`
+/// sorts by collation, and every row below the numeric high-water mark is stranded. The
+/// implicit cast also costs the column's index.
 fn format_offset_value(value: &str, kind: OffsetKind) -> String {
-    // Numeric-looking text is still quoted for a collation-ordered column, and a
-    // value that cannot be parsed is quoted whatever the kind claims, so nothing
-    // unparsed reaches the query unquoted.
     let bare = kind != OffsetKind::Lexical
         && (value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok_and(|v| v.is_finite()));
     if bare {
@@ -3156,14 +3156,14 @@ mod tests {
 
     #[test]
     fn given_result_set_projecting_the_tracking_column_should_accept_the_batch() {
-        assert!(ensure_tracking_column_projected(&["id", "name"], "id").is_ok());
+        assert!(ensure_tracking_column_projected(["id", "name"], "id").is_ok());
     }
 
     #[test]
     fn given_result_set_without_the_tracking_column_should_reject_the_batch() {
         // The replay loop this closes: no column means no row yields a cursor, so
         // every poll re-publishes the same rows and the offset never moves.
-        let error = ensure_tracking_column_projected(&["row_id", "name"], "id")
+        let error = ensure_tracking_column_projected(["row_id", "name"], "id")
             .expect_err("a result set missing the tracking column must not produce a batch");
         assert!(matches!(error, FetchError::MissingTrackingColumn(_)));
     }
@@ -3174,15 +3174,15 @@ mod tests {
         // information_schema probe at open(), so `tracking_column = "ID"` against a
         // column declared `id` starts up. An exact match here would then disable the
         // table on every poll, telling the operator to fix an alias that never existed.
-        assert!(ensure_tracking_column_projected(&["id", "name"], "ID").is_ok());
-        assert!(ensure_tracking_column_projected(&["ID", "name"], "id").is_ok());
+        assert!(ensure_tracking_column_projected(["id", "name"], "ID").is_ok());
+        assert!(ensure_tracking_column_projected(["ID", "name"], "id").is_ok());
     }
 
     #[test]
     fn given_aliased_tracking_column_should_reject_the_batch() {
         // `SELECT id AS row_id` projects `row_id`. The alias is what the result set
         // carries, so matching on the underlying column name would be wrong.
-        assert!(ensure_tracking_column_projected(&["row_id"], "id").is_err());
+        assert!(ensure_tracking_column_projected(["row_id"], "id").is_err());
     }
 
     #[test]
@@ -3190,7 +3190,7 @@ mod tests {
         // Both halves of the fix are in the message: what was looked for, and what
         // the query actually returned.
         let FetchError::MissingTrackingColumn(reason) =
-            ensure_tracking_column_projected(&["row_id", "payload"], "id").unwrap_err()
+            ensure_tracking_column_projected(["row_id", "payload"], "id").unwrap_err()
         else {
             panic!("expected a missing-tracking-column violation");
         };

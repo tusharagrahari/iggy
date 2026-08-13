@@ -532,10 +532,6 @@ impl MySqlSourceDeleteFixture {
             .await
             .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
     }
-
-    pub async fn count_rows(&self, pool: &Pool<MySql>) -> i64 {
-        MySqlSourceOps::count_rows(self, pool).await
-    }
 }
 
 #[async_trait]
@@ -622,10 +618,6 @@ impl MySqlSourceMarkFixture {
             .execute(pool)
             .await
             .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
-    }
-
-    pub async fn count_rows(&self, pool: &Pool<MySql>) -> i64 {
-        MySqlSourceOps::count_rows(self, pool).await
     }
 
     pub async fn count_unprocessed(&self, pool: &Pool<MySql>) -> i64 {
@@ -829,10 +821,6 @@ impl MySqlSourceComputedTrackingFixture {
             .await
             .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
     }
-
-    pub async fn count_rows(&self, pool: &Pool<MySql>) -> i64 {
-        MySqlSourceOps::count_rows(self, pool).await
-    }
 }
 
 #[async_trait]
@@ -925,10 +913,6 @@ impl MySqlSourceDescendingQueryFixture {
             .await
             .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
     }
-
-    pub async fn count_rows(&self, pool: &Pool<MySql>) -> i64 {
-        MySqlSourceOps::count_rows(self, pool).await
-    }
 }
 
 #[async_trait]
@@ -1015,10 +999,6 @@ impl MySqlSourceAliasedTrackingFixture {
             .execute(pool)
             .await
             .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
-    }
-
-    pub async fn count_rows(&self, pool: &Pool<MySql>) -> i64 {
-        MySqlSourceOps::count_rows(self, pool).await
     }
 }
 
@@ -1137,10 +1117,6 @@ impl MySqlSourceNullTrackingFixture {
             .execute(pool)
             .await
             .unwrap_or_else(|e| panic!("Failed to backfill tracking values: {e}"));
-    }
-
-    pub async fn count_rows(&self, pool: &Pool<MySql>) -> i64 {
-        MySqlSourceOps::count_rows(self, pool).await
     }
 }
 
@@ -1265,10 +1241,6 @@ impl MySqlSourceTimestampTrackingFixture {
             .await
             .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
     }
-
-    pub async fn count_rows(&self, pool: &Pool<MySql>) -> i64 {
-        MySqlSourceOps::count_rows(self, pool).await
-    }
 }
 
 #[async_trait]
@@ -1369,10 +1341,6 @@ impl MySqlSourceTimestampDeleteFixture {
             .await
             .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
     }
-
-    pub async fn count_rows(&self, pool: &Pool<MySql>) -> i64 {
-        MySqlSourceOps::count_rows(self, pool).await
-    }
 }
 
 #[async_trait]
@@ -1458,10 +1426,6 @@ impl MySqlSourceJsonTrackingFixture {
             .execute(pool)
             .await
             .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
-    }
-
-    pub async fn count_rows(&self, pool: &Pool<MySql>) -> i64 {
-        MySqlSourceOps::count_rows(self, pool).await
     }
 }
 
