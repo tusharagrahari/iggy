@@ -2949,71 +2949,29 @@ mod tests {
     }
 
     #[test]
-    fn given_query_shapes_defeating_text_inspection_should_reject_misordered_rows() {
-        // The guard is deliberately independent of SQL syntax, so each shape is
-        // expressed as the row order it actually produces. Every one of these
-        // contains an ORDER BY (or an ASC) in its text while returning rows whose
-        // tracking values decrease, which is exactly what a `contains("ORDER BY")`
-        // or `contains("DESC")` check gets wrong.
-        let shapes: &[(&str, &[&str])] = &[
-            ("ORDER BY id DESC", &["30", "20", "10"]),
-            ("no ORDER BY at all", &["10", "30", "20"]),
-            (
-                "ORDER BY only inside a derived table, which MySQL discards: \
-                 SELECT * FROM (SELECT * FROM t ORDER BY id) x LIMIT 10",
-                &["20", "10", "30"],
-            ),
-            (
-                "ORDER BY only inside a CTE: \
-                 WITH x AS (SELECT * FROM t ORDER BY id) SELECT * FROM x",
-                &["30", "10", "20"],
-            ),
-            (
-                "window ordering only, no result ordering: \
-                 SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM t",
-                &["20", "30", "10"],
-            ),
-            (
-                "ORDER BY inside a scalar subquery in the SELECT list",
-                &["40", "10"],
-            ),
-            (
-                "UNION with per-branch ORDER BY and no outer ORDER BY",
-                &["10", "30", "20"],
-            ),
-            (
-                "ordered ascending, but by a column other than tracking_column: \
-                 ORDER BY created_at ASC",
-                &["7", "3", "9"],
-            ),
-            (
-                "ORDER BY 1 resolving to a different column under SELECT *",
-                &["5", "2"],
-            ),
-            (
-                "ORDER BY id ASC, then reversed by an outer wrapper",
-                &["2", "1"],
-            ),
+    fn given_a_batch_whose_values_decrease_should_be_rejected() {
+        // The guard reads the values, never the SQL, so a query whose result order
+        // cannot be judged from its text - an ORDER BY confined to a derived table or
+        // a CTE, a window clause, an ordering by some other column - is caught here
+        // whenever it does return decreasing values, and left alone when it does not.
+        let batches: &[(&str, &[&str])] = &[
+            ("decreasing from the first pair", &["30", "20", "10"]),
+            ("decreasing only at the last pair", &["10", "30", "20"]),
+            ("two rows, the second below the first", &["2", "1"]),
         ];
 
-        for (shape, values) in shapes {
+        for (batch, values) in batches {
             let result = run_guard("id", OffsetKind::Numeric, values);
-            assert!(
-                result.is_err(),
-                "expected rows to be rejected for shape: {shape}"
-            );
+            assert!(result.is_err(), "expected rows to be rejected: {batch}");
         }
     }
 
     #[test]
-    fn given_correctly_ordered_query_shapes_should_accept_rows() {
+    fn given_a_batch_whose_values_never_decrease_should_be_accepted() {
         // The mirror of the above: none of these may be rejected, or a working
         // deployment would be disabled.
-        let shapes: &[(&str, &[&str])] = &[
-            ("ORDER BY id, implicit ASC", &["10", "20", "30"]),
-            ("ORDER BY id ASC", &["1", "2", "3"]),
-            ("ORDER BY `id` ASC, backtick quoted", &["1", "2", "3"]),
-            ("ORDER BY t.id ASC, qualified", &["1", "2", "3"]),
+        let batches: &[(&str, &[&str])] = &[
+            ("ascending", &["10", "20", "30"]),
             (
                 "ascending across the 9 to 10 lexical boundary",
                 &["8", "9", "10", "11"],
@@ -3025,16 +2983,13 @@ mod tests {
             ("single row", &["42"]),
         ];
 
-        for (shape, values) in shapes {
+        for (batch, values) in batches {
             let result = run_guard("id", OffsetKind::Numeric, values);
-            assert!(
-                result.is_ok(),
-                "expected rows to be accepted for shape: {shape}"
-            );
+            assert!(result.is_ok(), "expected rows to be accepted: {batch}");
         }
 
         // Collation-ordered columns, where MySQL's ascending order is lexical.
-        let lexical_shapes: &[(&str, &[&str])] = &[
+        let lexical_batches: &[(&str, &[&str])] = &[
             (
                 "timestamp tracking column ascending",
                 &["2024-01-15T10:30:00Z", "2024-01-15T10:31:00Z"],
@@ -3049,12 +3004,9 @@ mod tests {
             ),
         ];
 
-        for (shape, values) in lexical_shapes {
+        for (batch, values) in lexical_batches {
             let result = run_guard("id", OffsetKind::Lexical, values);
-            assert!(
-                result.is_ok(),
-                "expected rows to be accepted for shape: {shape}"
-            );
+            assert!(result.is_ok(), "expected rows to be accepted: {batch}");
         }
     }
 

@@ -1520,3 +1520,199 @@ impl TestFixture for MySqlSourceJsonTrackingFixture {
         envs
     }
 }
+
+/// MySQL source fixture whose `tracking_column` differs in case from the column the
+/// table declares.
+///
+/// MySQL matches column identifiers case-insensitively and so does the startup
+/// probe, so `tracking_column = "ID"` against a column declared `id` starts up. The
+/// result set then carries `id`, and the two sites this fixture reaches - the
+/// projection check and the row loop that reads the tracking value - each leave the
+/// table publishing nothing if they compare exactly.
+///
+/// The table is created during `setup()`, before the runtime starts, so the probe
+/// runs against the real column instead of deferring. That also means the kind is
+/// already resolved when the first query is built, which is why the result-set kind
+/// lookup is out of reach here: matching exactly there would fall back to the
+/// resolved kind and change nothing.
+pub struct MySqlSourceCaseMismatchedTrackingFixture {
+    container: MySqlContainer,
+}
+
+impl MySqlOps for MySqlSourceCaseMismatchedTrackingFixture {
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl MySqlSourceOps for MySqlSourceCaseMismatchedTrackingFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl MySqlSourceCaseMismatchedTrackingFixture {
+    const TABLE: &'static str = "test_case_mismatched_tracking";
+
+    pub async fn insert_row(&self, pool: &Pool<MySql>, name: &str) {
+        let query = format!("INSERT INTO `{}` (name) VALUES (?)", Self::TABLE);
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+}
+
+#[async_trait]
+impl TestFixture for MySqlSourceCaseMismatchedTrackingFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        let pool = container.create_pool().await?;
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                name VARCHAR(255) NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(&pool)
+            .await
+            .map_err(|e| TestBinaryError::FixtureSetup {
+                fixture_type: "MySqlSourceCaseMismatchedTrackingFixture".to_string(),
+                message: format!("Failed to create table: {e}"),
+            })?;
+        pool.close().await;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "ID".to_string());
+        envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            ENV_SOURCE_PLUGIN_PATH.to_string(),
+        );
+        envs
+    }
+}
+
+/// MySQL source fixture whose `custom_query` aliases a `tinyint(1)` column onto the
+/// tracking column name.
+///
+/// The startup gate judges the column the table declares, so a `tinyint` named
+/// directly is refused there. Under an alias the table has no such column at all,
+/// the probe defers to the result set, and the value reaches the row loop: sqlx
+/// names a width-1 tinyint `BOOLEAN` and decodes it to `true`/`false`, which has no
+/// ordered scalar form and cannot be a cursor. That is caught per row rather than at
+/// startup, which is the whole of what this fixture pins.
+pub struct MySqlSourceTinyintTrackingFixture {
+    container: MySqlContainer,
+}
+
+impl MySqlOps for MySqlSourceTinyintTrackingFixture {
+    fn container(&self) -> &MySqlContainer {
+        &self.container
+    }
+}
+
+impl MySqlSourceOps for MySqlSourceTinyintTrackingFixture {
+    fn table_name(&self) -> &str {
+        Self::TABLE
+    }
+}
+
+impl MySqlSourceTinyintTrackingFixture {
+    const TABLE: &'static str = "test_tinyint_tracking";
+
+    pub async fn insert_row(&self, pool: &Pool<MySql>, name: &str) {
+        let query = format!(
+            "INSERT INTO `{}` (is_active, name) VALUES (TRUE, ?)",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(name)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to insert row: {e}"));
+    }
+}
+
+#[async_trait]
+impl TestFixture for MySqlSourceTinyintTrackingFixture {
+    async fn setup() -> Result<Self, TestBinaryError> {
+        let container = MySqlContainer::start().await?;
+        let pool = container.create_pool().await?;
+        // Created before the runtime starts so the probe takes the "the table has no
+        // such column, assume custom_query projects it" branch rather than the one
+        // for a table that does not exist yet.
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS `{}` (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                is_active BOOLEAN NOT NULL,
+                name VARCHAR(255) NOT NULL
+            )",
+            Self::TABLE
+        );
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .execute(&pool)
+            .await
+            .map_err(|e| TestBinaryError::FixtureSetup {
+                fixture_type: "MySqlSourceTinyintTrackingFixture".to_string(),
+                message: format!("Failed to create table: {e}"),
+            })?;
+        pool.close().await;
+        Ok(Self { container })
+    }
+
+    fn connectors_runtime_envs(&self) -> HashMap<String, String> {
+        let mut envs = HashMap::new();
+        envs.insert(
+            ENV_SOURCE_CONNECTION_STRING.to_string(),
+            self.container.connection_string.clone(),
+        );
+        envs.insert(ENV_SOURCE_TABLES.to_string(), format!("[{}]", Self::TABLE));
+        envs.insert(ENV_SOURCE_TRACKING_COLUMN.to_string(), "flag".to_string());
+        envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "id".to_string());
+        // Ordered and filtered by `id`, so the only thing wrong with the batch is the
+        // value the cursor would be taken from.
+        envs.insert(
+            ENV_SOURCE_CUSTOM_QUERY.to_string(),
+            "SELECT *, is_active AS flag FROM $table WHERE id > $offset ORDER BY id LIMIT $limit"
+                .to_string(),
+        );
+        envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_STREAM.to_string(),
+            DEFAULT_TEST_STREAM.to_string(),
+        );
+        envs.insert(
+            ENV_SOURCE_STREAMS_0_TOPIC.to_string(),
+            DEFAULT_TEST_TOPIC.to_string(),
+        );
+        envs.insert(ENV_SOURCE_STREAMS_0_SCHEMA.to_string(), "json".to_string());
+        envs.insert(ENV_SOURCE_POLL_INTERVAL.to_string(), "10ms".to_string());
+        envs.insert(
+            ENV_SOURCE_PATH.to_string(),
+            ENV_SOURCE_PLUGIN_PATH.to_string(),
+        );
+        envs
+    }
+}

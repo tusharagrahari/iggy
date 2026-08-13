@@ -74,13 +74,13 @@ pub use mongodb::{
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,
 };
 pub use mysql::{
-    MySqlOps, MySqlSourceAliasedTrackingFixture, MySqlSourceComputedTrackingFixture,
-    MySqlSourceDeleteFixture, MySqlSourceDescendingQueryFixture, MySqlSourceJsonDirectFixture,
-    MySqlSourceJsonFixture, MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture,
-    MySqlSourceMissingPayloadColumnFixture, MySqlSourceNoMetadataFixture,
-    MySqlSourceNullTrackingFixture, MySqlSourceOps, MySqlSourceRawFixture,
-    MySqlSourceTextTrackingFixture, MySqlSourceTimestampDeleteFixture,
-    MySqlSourceTimestampTrackingFixture,
+    MySqlOps, MySqlSourceAliasedTrackingFixture, MySqlSourceCaseMismatchedTrackingFixture,
+    MySqlSourceComputedTrackingFixture, MySqlSourceDeleteFixture,
+    MySqlSourceDescendingQueryFixture, MySqlSourceJsonDirectFixture, MySqlSourceJsonFixture,
+    MySqlSourceJsonTrackingFixture, MySqlSourceMarkFixture, MySqlSourceMissingPayloadColumnFixture,
+    MySqlSourceNoMetadataFixture, MySqlSourceNullTrackingFixture, MySqlSourceOps,
+    MySqlSourceRawFixture, MySqlSourceTextTrackingFixture, MySqlSourceTimestampDeleteFixture,
+    MySqlSourceTimestampTrackingFixture, MySqlSourceTinyintTrackingFixture,
 };
 pub use postgres::{
     PostgresOps, PostgresSinkByteaFixture, PostgresSinkFixture, PostgresSinkJsonFixture,
