@@ -1500,7 +1500,7 @@ impl TestFixture for MySqlSourceJsonTrackingFixture {
         envs.insert(ENV_SOURCE_PRIMARY_KEY_COLUMN.to_string(), "id".to_string());
         envs.insert(
             ENV_SOURCE_CUSTOM_QUERY.to_string(),
-            "SELECT * FROM $table ORDER BY id LIMIT $limit".to_string(),
+            "SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit".to_string(),
         );
         envs.insert(ENV_SOURCE_INCLUDE_METADATA.to_string(), "true".to_string());
         envs.insert(

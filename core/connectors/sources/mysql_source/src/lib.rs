@@ -30,7 +30,7 @@ use sqlx::{Column, MySql, Pool, Row, TypeInfo, mysql::MySqlPoolOptions};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -46,6 +46,16 @@ const DEFAULT_RETRY_DELAY: &str = "1s";
 /// dedup, so the value must never change once connectors are in the field.
 const MESSAGE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x8f3b1e6a4c9d4f2a9b7c0d1e2f3a4b5c);
 
+/// A disabled table is skipped before anything is logged, so without a reminder the
+/// only evidence a connector went dark is the single line written when it happened.
+/// At the default 10s poll interval this repeats it every ten minutes.
+const DISABLED_TABLES_LOG_INTERVAL: u64 = 60;
+
+/// How many consecutive polls a table may end in `CursorRegression` before the repeat
+/// stops reading as transient. Nothing is published in the meantime, so past this it
+/// is a stall the operator has to see.
+const CURSOR_REGRESSION_ERROR_THRESHOLD: u32 = 3;
+
 #[derive(Debug)]
 pub struct MySqlSource {
     pub id: u32,
@@ -58,6 +68,8 @@ pub struct MySqlSource {
     last_batch_full: AtomicBool,
     poisoned_tables: Mutex<HashSet<String>>,
     tracking_kinds: Mutex<HashMap<String, OffsetKind>>,
+    polls: AtomicU64,
+    cursor_regressions: Mutex<HashMap<String, u32>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,11 +113,12 @@ struct ProcessedRow {
 /// Why a table's batch could not be produced.
 enum FetchError {
     Ordering(String),
-    /// The batch opened below the cursor it was told to resume from. Retried rather
-    /// than latched, because unlike a within-batch decrease this can come from the
-    /// data rather than the query: a `TIMESTAMP` tracking column read through a
-    /// session time zone that moves backwards (a DST fall-back) reports lower wall
-    /// clocks for later rows, and that resolves on its own.
+    /// The batch opened below the cursor it was told to resume from, so the query's
+    /// filter and the cursor disagree about what "past the offset" means. Retried
+    /// rather than latched, because unlike a within-batch decrease it depends on the
+    /// rows as much as on the query: a `custom_query` whose WHERE admits rows the
+    /// cursor does not gate (an OR branch is the usual one) only fails while such a
+    /// row is there, so it can clear without a config change.
     CursorRegression(String),
     MissingTrackingColumn(String),
     UnusableTrackingValue(String),
@@ -158,6 +171,21 @@ fn offset_kind_for_data_type(data_type: &str) -> OffsetKind {
     }
 }
 
+/// Whether MySQL orders the column by its collation. The other lexically compared
+/// types are the temporal ones, which render fixed-width and so compare the same way
+/// as text no matter what the collation is.
+fn is_collation_ordered(data_type: &str) -> bool {
+    const TEXT: &[&str] = &[
+        "char",
+        "varchar",
+        "tinytext",
+        "text",
+        "mediumtext",
+        "longtext",
+    ];
+    TEXT.iter().any(|text| data_type.eq_ignore_ascii_case(text))
+}
+
 fn offset_kind_for_type_name(type_name: &str) -> OffsetKind {
     match type_name {
         "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "BIGINT" | "TINYINT UNSIGNED"
@@ -208,6 +236,35 @@ fn unusable_tracking_type(data_type: &str) -> Option<&'static str> {
         );
     }
     None
+}
+
+/// What a `custom_query` may begin with. `TABLE` is MySQL 8.0.19's table statement,
+/// and `(` opens a parenthesized query such as `(SELECT ...) UNION (SELECT ...)`.
+const READ_STATEMENT_STARTS: &[&str] = &["SELECT", "WITH", "TABLE", "("];
+
+/// The token that decides which statement a query is, skipping leading comments in
+/// all three MySQL spellings. Returns a single character when the statement does not
+/// open with a word, so a parenthesized query is still recognisable.
+fn leading_statement_token(query: &str) -> Option<String> {
+    let mut rest = query.trim_start();
+    loop {
+        rest = if let Some(after) = rest.strip_prefix("/*") {
+            after.split_once("*/")?.1.trim_start()
+        } else if rest.starts_with("--") || rest.starts_with('#') {
+            rest.split_once('\n')?.1.trim_start()
+        } else {
+            break;
+        };
+    }
+
+    let word: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if word.is_empty() {
+        return rest.chars().next().map(String::from);
+    }
+    Some(word.to_uppercase())
 }
 
 /// The order the tracking column sorts in according to the result set that just
@@ -589,6 +646,8 @@ impl MySqlSource {
             last_batch_full: AtomicBool::new(false),
             poisoned_tables: Mutex::new(HashSet::new()),
             tracking_kinds: Mutex::new(HashMap::new()),
+            polls: AtomicU64::new(0),
+            cursor_regressions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -747,6 +806,19 @@ impl MySqlSource {
                 );
             }
 
+            if is_collation_ordered(&data_type) {
+                warn!(
+                    "tracking_column '{tracking_column}' on table '{table}' has type \
+                     '{column_type}', so its cursor is compared in the column's collation and has \
+                     to be unique and monotonically increasing in that order. Unpadded digit \
+                     strings are not: '17' sorts below '9', after which the connector idles at \
+                     the collation maximum forever. Zero-padded numbers, ULIDs and KSUIDs are. A \
+                     case- or accent-insensitive collation such as the default utf8mb4_0900_ai_ci \
+                     also breaks uniqueness, since 'ORD-1a' equals 'ORD-1A' and one of the two is \
+                     dropped, so prefer a _bin collation."
+                );
+            }
+
             kinds.insert(table.clone(), offset_kind_for_data_type(&data_type));
         }
         Ok(kinds)
@@ -862,26 +934,69 @@ impl MySqlSource {
         Ok(q)
     }
 
-    /// `custom_query` runs once per configured table, so the query and the table
-    /// list have to agree on how many distinct result sets they describe.
+    /// The query is substituted as text and re-executed once per configured table on
+    /// every poll for the life of the process, so a shape that cannot terminate does
+    /// not fail, it repeats. What can be judged from the text alone is judged here,
+    /// at startup, rather than left to the first poll.
     fn validate_custom_query(&self, query: &str) -> Result<(), Error> {
-        let query_upper = query.to_uppercase();
-        if !query_upper.contains("SELECT") {
-            warn!("Custom query should contain SELECT statement");
+        let tracking_column = self.tracking_column();
+
+        match leading_statement_token(query) {
+            None => {
+                return Err(Error::InitError(
+                    "custom_query has no statement: it is empty, or nothing but comments"
+                        .to_string(),
+                ));
+            }
+            Some(token) if !READ_STATEMENT_STARTS.contains(&token.as_str()) => {
+                return Err(Error::InitError(format!(
+                    "custom_query must be a read, but it starts with '{token}'. It is executed \
+                     once per configured table on every poll for the life of the process, so a \
+                     statement that writes would re-run forever. Start it with SELECT, WITH or \
+                     TABLE."
+                )));
+            }
+            Some(_) => {}
         }
-        // A hint, not a check: the enforcement is `OrderingGuard`, on the rows. Text
-        // cannot tell an ordered query from one whose ORDER BY MySQL is free to
-        // discard, but a query with no ORDER BY at all is worth saying out loud at
-        // startup rather than leaving to the first poll.
-        if !query_upper.contains("ORDER BY") {
-            let tracking_column = self.tracking_column();
-            warn!(
-                "custom_query has no ORDER BY. The next offset is the tracking value of the last \
-                 row returned, which is only the highest one when the batch arrives ascending by \
-                 '{tracking_column}'; without that, rows are skipped or re-read. Add \
-                 `ORDER BY {tracking_column}`."
-            );
+
+        // Collapsed so `ORDER\nBY` and `ORDER  BY` read the same as `ORDER BY`; the
+        // check hard-fails, so a formatting difference must not decide it.
+        let normalized = query
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_uppercase();
+
+        // Two shapes, two failures. With `$offset` the stored cursor is what limits
+        // the next poll, and it is only the batch's maximum when the rows arrive
+        // ascending, so an unordered query skips rows. Without `$offset` nothing
+        // limits the poll at all: the cursor is written but never read back, so the
+        // same rows return forever unless the rows leave the result set. Only
+        // `delete_after_read` guarantees that on its own - `processed_column` marks
+        // rows the connector never filters on outside the query it builds itself, so
+        // that arm rests on the operator's WHERE and is the weaker of the two.
+        if query.contains("$offset") {
+            if !normalized.contains("ORDER BY") {
+                return Err(Error::InitError(format!(
+                    "custom_query filters on $offset but has no ORDER BY. The next offset is the \
+                     tracking value of the last row returned, which is only the highest one when \
+                     the batch arrives ascending by '{tracking_column}'; without that, rows below \
+                     it are skipped permanently. Add `ORDER BY {tracking_column}`."
+                )));
+            }
+        } else if !self.config.delete_after_read.unwrap_or(false)
+            && self.config.processed_column.is_none()
+        {
+            return Err(Error::InitError(format!(
+                "custom_query does not filter on $offset, so every poll returns the same rows and \
+                 publishes them again. Interpolate $offset (`WHERE {tracking_column} > $offset`, \
+                 which also needs an ORDER BY), or take the rows out of the next poll by setting \
+                 delete_after_read, which deletes them, or processed_column, which marks them - \
+                 with processed_column the query has to exclude the marked rows itself, since the \
+                 connector only appends that filter to the query it builds."
+            )));
         }
+
         if query.contains("$table") && self.config.tables.is_empty() {
             return Err(Error::InitError(
                 "custom_query uses $table but no tables are configured, so the placeholder \
@@ -1042,6 +1157,7 @@ impl MySqlSource {
         let mut batches: Vec<TableBatch> = Vec::with_capacity(self.config.tables.len());
         let mut any_batch_full = false;
 
+        let poll_number = self.polls.fetch_add(1, Ordering::Relaxed) + 1;
         let poisoned = { self.poisoned_tables.lock().await.clone() };
         let mut newly_poisoned: Vec<String> = Vec::new();
 
@@ -1072,6 +1188,9 @@ impl MySqlSource {
                     } else {
                         debug!("Fetched {} rows from table '{table}'", batch.messages.len());
                     }
+                    if !batch.messages.is_empty() {
+                        self.cursor_regressions.lock().await.remove(table);
+                    }
                     // A full batch means the LIMIT was hit, so more rows are waiting.
                     any_batch_full |= batch.messages.len() as u32 >= batch_size;
                     batches.push(batch);
@@ -1086,12 +1205,30 @@ impl MySqlSource {
                     newly_poisoned.push(table.clone());
                 }
                 Err(FetchError::CursorRegression(reason)) => {
-                    warn!(
-                        "Table '{table}' at offset {}: {reason} No rows were published and the \
-                         offset was not advanced. The table stays enabled, since this can \
-                         resolve without a config change.",
-                        last_offset.as_deref().unwrap_or("<start>")
-                    );
+                    // Cleared only by a batch that carried rows, so the run counts polls
+                    // since the table last published anything. An idle poll produces as
+                    // little as a rejected one does and must not read as recovery.
+                    let consecutive = {
+                        let mut regressions = self.cursor_regressions.lock().await;
+                        let consecutive = regressions.entry(table.clone()).or_insert(0);
+                        *consecutive += 1;
+                        *consecutive
+                    };
+                    let offset = last_offset.as_deref().unwrap_or("<start>");
+                    if consecutive >= CURSOR_REGRESSION_ERROR_THRESHOLD {
+                        error!(
+                            "Table '{table}' at offset {offset}: {reason} No rows were published \
+                             and the offset was not advanced. This is the {consecutive}th \
+                             consecutive poll to end this way, so it is no longer resolving on \
+                             its own: the table stays enabled but has published nothing since."
+                        );
+                    } else {
+                        warn!(
+                            "Table '{table}' at offset {offset}: {reason} No rows were published \
+                             and the offset was not advanced. The table stays enabled, since this \
+                             can resolve without a config change."
+                        );
+                    }
                 }
                 Err(FetchError::StaleOffsetKind(reason)) => {
                     warn!(
@@ -1132,6 +1269,26 @@ impl MySqlSource {
                     "All configured tables are disabled because their batches cannot yield a \
                      cursor; {CONNECTOR_NAME} connector with ID: {} is idle until restarted",
                     self.id
+                );
+            }
+        }
+
+        // From the next poll on a disabled table is skipped before anything is logged,
+        // so the one line written when it was disabled can scroll out of the operator's
+        // log window and leave a dark connector looking healthy.
+        if poll_number.is_multiple_of(DISABLED_TABLES_LOG_INTERVAL) {
+            let poisoned_tables = self.poisoned_tables.lock().await;
+            if !poisoned_tables.is_empty() {
+                let mut disabled: Vec<&str> = poisoned_tables.iter().map(String::as_str).collect();
+                disabled.sort_unstable();
+                error!(
+                    "{} of {} configured table(s) are still disabled and are not being polled by \
+                     {CONNECTOR_NAME} connector with ID: {}, and will stay that way until it is \
+                     restarted: {}",
+                    disabled.len(),
+                    self.config.tables.len(),
+                    self.id,
+                    disabled.join(", ")
                 );
             }
         }
@@ -1778,10 +1935,14 @@ fn format_offset_value(value: &str, kind: OffsetKind) -> String {
     if bare {
         value.to_string()
     } else {
+        // NUL is escaped, not dropped: a shortened literal is a smaller literal, so
+        // MySQL would return the row the cursor already passed and the guard would
+        // read that as a regression. Ordered after the backslash pass so the escape
+        // this one writes is not doubled.
         let escaped = value
             .replace('\\', "\\\\")
             .replace('\'', "''")
-            .replace('\0', "");
+            .replace('\0', "\\0");
         format!("'{escaped}'")
     }
 }
@@ -2193,15 +2354,20 @@ mod tests {
         let mut config = test_config();
         config.tables = vec![];
         let source = MySqlSource::new(1, config, None);
-        let result = source.validate_custom_query("SELECT * FROM $table");
-        assert!(matches!(result, Err(Error::InitError(_))));
+        let result =
+            source.validate_custom_query("SELECT * FROM $table WHERE id > $offset ORDER BY id");
+        assert!(
+            matches!(result, Err(Error::InitError(ref message)) if message.contains("$table")),
+            "expected an InitError naming the placeholder, got {result:?}"
+        );
     }
 
     #[test]
     fn given_valid_custom_query_should_pass() {
         // A well-formed SELECT with tables configured passes validation.
         let source = MySqlSource::new(1, test_config(), None);
-        let result = source.validate_custom_query("SELECT * FROM $table WHERE id > $offset");
+        let result =
+            source.validate_custom_query("SELECT * FROM $table WHERE id > $offset ORDER BY id");
         assert!(result.is_ok());
     }
 
@@ -2212,7 +2378,7 @@ mod tests {
         let mut config = test_config();
         config.tables = vec!["users".to_string(), "orders".to_string()];
         let source = MySqlSource::new(1, config, None);
-        match source.validate_custom_query("SELECT * FROM events WHERE id > $offset") {
+        match source.validate_custom_query("SELECT * FROM events WHERE id > $offset ORDER BY id") {
             Err(Error::InitError(message)) => {
                 assert!(message.contains("users, orders"), "message was: {message}")
             }
@@ -2227,7 +2393,8 @@ mod tests {
         let mut config = test_config();
         config.tables = vec!["users".to_string(), "orders".to_string()];
         let source = MySqlSource::new(1, config, None);
-        let result = source.validate_custom_query("SELECT * FROM $table WHERE id > $offset");
+        let result =
+            source.validate_custom_query("SELECT * FROM $table WHERE id > $offset ORDER BY id");
         assert!(result.is_ok());
     }
 
@@ -2238,7 +2405,8 @@ mod tests {
         let mut config = test_config();
         config.tables = vec!["users".to_string()];
         let source = MySqlSource::new(1, config, None);
-        let result = source.validate_custom_query("SELECT * FROM users WHERE id > $offset");
+        let result =
+            source.validate_custom_query("SELECT * FROM users WHERE id > $offset ORDER BY id");
         assert!(result.is_ok());
     }
 
@@ -2278,6 +2446,9 @@ mod tests {
         );
         assert_eq!(format_offset_value("a\\b", OffsetKind::Lexical), "'a\\\\b'");
         assert_eq!(format_offset_value("42", OffsetKind::Numeric), "42");
+        // Dropping the NUL would compare against a shorter, smaller value and hand
+        // back the row the cursor already passed.
+        assert_eq!(format_offset_value("a\0b", OffsetKind::Lexical), "'a\\0b'");
     }
 
     #[test]
@@ -3087,14 +3258,108 @@ mod tests {
     }
 
     #[test]
-    fn given_custom_query_without_order_by_should_warn_and_not_fail_open() {
-        // The enforcement is the ordering guard on the rows; text inspection cannot
-        // tell a real ORDER BY from one MySQL discards, so this stays a hint.
+    fn given_offset_filtered_custom_query_without_order_by_should_fail_open() {
+        // The cursor is the last row's tracking value, which is only the batch maximum
+        // when the rows arrive ascending. Nothing downstream can recover the rows an
+        // unordered batch skipped, so this cannot be left to the guard.
         let source = MySqlSource::new(1, test_config(), None);
+        let result =
+            source.validate_custom_query("SELECT * FROM $table WHERE id > $offset LIMIT $limit");
         assert!(
-            source
-                .validate_custom_query("SELECT * FROM $table WHERE id > $offset LIMIT $limit")
-                .is_ok()
+            matches!(result, Err(Error::InitError(ref message)) if message.contains("ORDER BY")),
+            "expected an InitError naming ORDER BY, got {result:?}"
         );
+    }
+
+    #[test]
+    fn given_order_by_split_across_lines_should_satisfy_the_check() {
+        // The check hard-fails, so how the clause is wrapped and indented must not
+        // decide whether the connector starts.
+        let source = MySqlSource::new(1, test_config(), None);
+        let result = source.validate_custom_query(
+            "SELECT * FROM $table\n  WHERE id > $offset\n  ORDER\n    BY id\n  LIMIT $limit",
+        );
+        assert!(result.is_ok(), "got {result:?}");
+    }
+
+    #[test]
+    fn given_custom_query_without_offset_or_a_consuming_mode_should_fail_open() {
+        // Nothing limits such a poll: the offset is written but never read back, so
+        // the same rows are republished on every cycle forever.
+        let source = MySqlSource::new(1, test_config(), None);
+        let result = source.validate_custom_query("SELECT * FROM $table WHERE status = 'new'");
+        assert!(
+            matches!(result, Err(Error::InitError(ref message)) if message.contains("$offset")),
+            "expected an InitError naming $offset, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn given_custom_query_without_offset_should_pass_when_rows_are_consumed() {
+        // delete_after_read and processed_column both take the rows out of the next
+        // poll's result set, which is what $offset would otherwise have done.
+        for consuming in [0, 1] {
+            let mut config = test_config();
+            if consuming == 0 {
+                config.delete_after_read = Some(true);
+            } else {
+                config.processed_column = Some("is_processed".to_string());
+            }
+            let source = MySqlSource::new(1, config, None);
+            let result = source.validate_custom_query("SELECT * FROM $table WHERE status = 'new'");
+            assert!(result.is_ok(), "got {result:?}");
+        }
+    }
+
+    #[test]
+    fn given_custom_query_that_is_not_a_read_should_fail_open() {
+        // The query re-executes once per table on every poll for the life of the
+        // process, so a mistyped statement that writes runs forever.
+        let source = MySqlSource::new(1, test_config(), None);
+        for query in [
+            "DELETE FROM $table WHERE id IN (SELECT id FROM stale) ORDER BY id",
+            "INSERT INTO archive SELECT * FROM $table WHERE id > $offset ORDER BY id",
+            "UPDATE $table SET flag = 1 WHERE id > $offset ORDER BY id",
+        ] {
+            let result = source.validate_custom_query(query);
+            assert!(
+                matches!(result, Err(Error::InitError(ref message)) if message.contains("must be a read")),
+                "expected an InitError for {query}, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_read_statement_shapes_should_pass_the_leading_token_check() {
+        // Comments and a parenthesized union are all legitimate ways to open a read,
+        // and the check hard-fails, so none of them may be mistaken for a write.
+        let source = MySqlSource::new(1, test_config(), None);
+        for query in [
+            "  \n SELECT * FROM $table WHERE id > $offset ORDER BY id",
+            "-- resume from the cursor\nSELECT * FROM $table WHERE id > $offset ORDER BY id",
+            "# resume from the cursor\nSELECT * FROM $table WHERE id > $offset ORDER BY id",
+            "/* resume from\n the cursor */ SELECT * FROM $table WHERE id > $offset ORDER BY id",
+            "WITH recent AS (SELECT * FROM $table WHERE id > $offset) \
+             SELECT * FROM recent ORDER BY id",
+            "(SELECT * FROM $table WHERE id > $offset) UNION (SELECT * FROM $table WHERE id > \
+             $offset) ORDER BY id",
+        ] {
+            let result = source.validate_custom_query(query);
+            assert!(result.is_ok(), "expected {query} to pass, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn given_a_query_that_is_only_comments_should_fail_open() {
+        // An unterminated block comment leaves no statement at all, which MySQL would
+        // reject on the first poll rather than at startup.
+        let source = MySqlSource::new(1, test_config(), None);
+        for query in ["   ", "-- nothing here", "/* never closed"] {
+            let result = source.validate_custom_query(query);
+            assert!(
+                matches!(result, Err(Error::InitError(ref message)) if message.contains("no statement")),
+                "expected an InitError for {query:?}, got {result:?}"
+            );
+        }
     }
 }

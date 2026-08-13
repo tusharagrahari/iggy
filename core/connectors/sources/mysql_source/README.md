@@ -60,14 +60,16 @@ custom_query = "SELECT * FROM $table WHERE id > $offset ORDER BY id LIMIT $limit
 | `delete_after_read` | bool | `false` | Delete rows after reading |
 | `processed_column` | string | none | Boolean column to mark as processed |
 | `primary_key_column` | string | tracking_column | PK for delete/mark operations |
-| `custom_query` | string | none | Custom SQL with parameter substitution |
+| `custom_query` | string | none | Custom SQL with parameter substitution; must be a read, and must either filter on `$offset` with an `ORDER BY` or consume its rows (see [What the query has to be](#what-the-query-has-to-be)) |
 | `verbose_logging` | bool | `false` | Log at info level instead of debug |
 | `max_retries` | u32 | `3` | Retries after the initial attempt for transient errors (3 = 4 total attempts) |
 | `retry_delay` | string | `1s` | Base delay between retries (e.g., `500ms`, `2s`) |
 
 ## Tracking Column Requirements
 
-Polling is **insert-only**. Each poll runs roughly `SELECT ... WHERE tracking_column > last_offset ORDER BY tracking_column ASC LIMIT batch_size` and stores the largest tracking value it saw as the next offset. For this to be lossless the **`tracking_column` must be unique and monotonically increasing** — an auto-increment primary key is the canonical choice.
+Polling is **insert-only**. Each poll runs roughly `SELECT ... WHERE tracking_column > last_offset ORDER BY tracking_column ASC LIMIT batch_size` and stores the largest tracking value it saw as the next offset. For this to be lossless the **`tracking_column` must be unique and monotonically increasing under the order MySQL sorts that column in** — an auto-increment primary key is the canonical choice.
+
+Which order that is depends on the type. Numeric columns sort by value; string columns sort by their collation, which is a different contract and an easy one to fail. See [Text columns sort by collation, not by value](#text-columns-sort-by-collation-not-by-value).
 
 `tracking_column` is required. It is the single field that decides whether polling loses rows, and the connector cannot check the choice for you: on the built-in query it reads the column's type and nullability but not the schema's intent, and a `custom_query` is substituted as text and never parsed, so nothing can confirm that the column you named is the one the query orders by.
 
@@ -94,6 +96,25 @@ At startup the connector also reads the column from `information_schema` and ref
 - `ENUM` and `SET` are sorted by MySQL on declaration index, not on the label the connector sees, so the two disagree whenever the members are not declared in alphabetical order. A bounded set of labels cannot be unique per row either.
 
 A nullable column is refused only when the connector builds its own query. With a `custom_query` it is a warning instead, because a query moves nullability in both directions: a `LEFT JOIN` introduces NULLs into a `NOT NULL` column, `WHERE ts IS NOT NULL` removes them from a nullable one. The per-poll check above catches an actual NULL.
+
+### Text columns sort by collation, not by value
+
+A `CHAR`, `VARCHAR` or `TEXT` tracking column is ordered by its collation, and collation order is not numeric order. `'17'` sorts **below** `'9'`, so a column holding unpadded digit strings breaks the moment its values differ in length:
+
+```text
+values '1'..'16', batch_size = 4 -> the cursor walks '12', '16', '5', '9' and drains the table
+insert '17' and '18'             -> both sort below '9', so WHERE col > '9' never returns them
+```
+
+Nothing reports it. Every batch was correctly ordered, and every poll after the drain is simply empty, so the connector stays healthy and idle forever. Dev, CI and early production all pass, because `'1'`..`'9'` order the same both ways; the break arrives with row 10.
+
+Safe under collation: zero-padded numbers (`'000017'`), ULIDs, KSUIDs, and anything else whose textual order is its generation order. Unsafe: unpadded numbers, and any scheme whose width varies.
+
+The collation decides uniqueness too. The default `utf8mb4_0900_ai_ci` is case- and accent-insensitive, so `'ORD-1a'` and `'ORD-1A'` compare **equal** and `> 'ORD-1a'` silently drops the other one. Declare text tracking columns with a `_bin` (or `_as_cs`) collation when the keys carry letters.
+
+The connector cannot tell a safe column from an unsafe one without reading the data, so it warns at startup for every `CHAR`, `VARCHAR` or `TEXT` tracking column, naming the table, the column and its type. Temporal columns are compared as text too but are not warned about: their rendering is fixed-width, so their text order is their chronological order whatever the collation is.
+
+The warning is only raised for a column the connector can find in `information_schema`. A `custom_query` projecting a computed or aliased tracking column has no such row, so its comparison order is settled from the first result set at poll time and no startup warning is possible.
 
 ## Output Modes
 
@@ -232,13 +253,26 @@ The query runs once per entry in `tables`, so with more than one table configure
 
 A query that hardcodes its table still needs that table listed in `tables`. The list is what the connector polls — an empty list means it polls nothing — and the name is also the offset key, the input to the deterministic message ID, and the `table_name` metadata field.
 
-The query must also project `tracking_column` under exactly that name, with a non-null scalar value in every row, and should filter on `$offset` — a query that does not re-reads the same rows on every poll by design. See [Tracking Column Requirements](#tracking-column-requirements) for what happens when it does not.
+The query must also project `tracking_column` under exactly that name, with a non-null scalar value in every row. See [Tracking Column Requirements](#tracking-column-requirements) for what happens when it does not.
+
+### What the query has to be
+
+Three things are checked at startup, before the connector opens. All three are `InitError`s: the query is substituted as text and re-executed once per configured table on every poll for the life of the process, so a wrong shape does not fail, it repeats.
+
+- **It has to be a read.** The first token, past any leading `--`, `#` or `/* */` comment, must be `SELECT`, `WITH`, `TABLE`, or the `(` of a parenthesized query. A `DELETE` or `UPDATE` typed into this field would re-run on every poll forever.
+- **With `$offset`, it needs an `ORDER BY`.** The next offset is the tracking value of the last row returned, which is only the batch's maximum when the rows arrive ascending. Without one, rows below that value are skipped permanently.
+- **Without `$offset`, it needs `delete_after_read` or `processed_column`.** Nothing else limits what the poll sees, so the same rows are published again on every cycle. The stored offset is written but never read back in this shape, so it cannot catch it either. What makes the query terminate is the rows leaving its result set.
+
+The `$offset` and no-`$offset` shapes are the two supported ones. A query that filters on `$offset` *and* consumes rows is fine as well.
+
+The third check verifies that a consuming mode is configured, not that it works. `delete_after_read` deletes the rows, so a query cannot return them twice. `processed_column` only marks them: **the connector does not add `WHERE <processed_column> = FALSE` to a `custom_query`**, it never parses one, so the query has to carry that predicate itself. Set `processed_column` without filtering on it and the shape the check exists to reject is exactly what you get.
 
 ### Ordering is checked on the rows
 
 If the query uses `$offset`, it must return rows ordered ascending by the tracking column (`ORDER BY <tracking_column>`; MySQL sorts ascending by default, so `ASC` doesn't need to be spelled out). The connector takes the tracking value of the *last row returned* as the next `$offset`, which is only the maximum when the batch is ascending.
 
-The connector verifies this on the rows themselves rather than by inspecting your SQL. If a row's
+Startup checks that an `ORDER BY` is there at all, and nothing more. The connector never parses your
+SQL, so which column it orders by and in which direction are judged on the rows instead. If a row's
 tracking value is lower than the previous row's, the poll for that table is abandoned: no messages
 are published, no rows are marked or deleted, and the stored offset is not advanced.
 
@@ -246,12 +280,19 @@ Because the same query returns the same misordered rows every cycle, the table i
 until the connector is restarted**, and the error names the table, the tracking column, and the two
 offending values. Other configured tables keep running.
 
+A disabled table is skipped before anything is logged, so that one error is the only evidence it
+happened. To keep a connector that has gone dark from looking healthy, the full set of disabled
+tables is logged again every 60 polls (ten minutes at the default `poll_interval`) for as long as
+any of them are disabled.
+
 The check also covers the gap between polls. A batch is compared against the offset it resumed from,
 so a batch that is ascending within itself but reaches back behind its own cursor is caught too. That
 case is logged and the cycle skipped, but the table stays enabled, because unlike a misordered query
 it can come from the data rather than the SQL and resolve on its own. It is only applied when the
 cursor is what limits the rows a poll can see: the built-in query always filters on it, a
-`custom_query` only if it interpolates `$offset`.
+`custom_query` only if it interpolates `$offset`. It repeats every poll until it does resolve, and
+from the third consecutive one it is logged at error rather than warning level: a table that has not
+recovered in three polls is stalled, and it has published nothing since the first.
 
 That comparison against the resume cursor is the whole of what a batch of one row can be judged on,
 and it only catches a row reaching *behind* the cursor. A row above it is indistinguishable from
@@ -373,7 +414,7 @@ Your table needs the boolean column:
 ALTER TABLE users ADD COLUMN is_processed BOOLEAN DEFAULT false;
 ```
 
-When `processed_column` is set, the connector automatically adds a `WHERE is_processed = FALSE` filter to the polling query, so only unprocessed rows are fetched.
+When `processed_column` is set, the connector adds a `WHERE is_processed = FALSE` filter to **the query it builds itself**, so only unprocessed rows are fetched. It cannot do that for a `custom_query`, which it substitutes as text without parsing: there, marking rows is all it does, and the query has to exclude them itself.
 
 ### Delivery semantics
 

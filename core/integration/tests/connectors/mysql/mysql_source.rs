@@ -1359,7 +1359,11 @@ async fn json_tracking_column_fails_startup_even_with_a_custom_query(
     );
 
     // Refusing at startup is what separates this from a connector that runs and
-    // rejects every batch; both publish nothing.
+    // rejects every batch; both publish nothing. Which check refused is not visible
+    // here - the SDK reduces open()'s error to a status code, so the runtime logs
+    // only that init failed. The fixture's query therefore has to satisfy every
+    // other startup check for this to mean anything, which is why it filters on
+    // $offset and orders by it.
     let (stdout, stderr) = harness
         .connectors_runtime()
         .expect("connectors runtime should be running")
