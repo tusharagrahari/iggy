@@ -24,6 +24,7 @@ mod elasticsearch;
 mod http;
 mod iceberg;
 mod influxdb;
+mod meilisearch;
 mod mongodb;
 mod mysql;
 mod postgres;
@@ -53,8 +54,8 @@ pub use clickhouse::{
 };
 pub use delta::{DeltaFixture, DeltaS3Fixture};
 pub use doris::{
-    DorisOps, DorisSinkColumnsMappingFixture, DorisSinkFixture, DorisSinkMaxFilterRatioFixture,
-    DorisSinkPreCreatedFixture,
+    DorisOps, DorisSinkColumnsMappingFixture, DorisSinkCsvFixture, DorisSinkFixture,
+    DorisSinkMaxFilterRatioFixture, DorisSinkPreCreatedFixture,
 };
 pub use elasticsearch::{ElasticsearchSinkFixture, ElasticsearchSourcePreCreatedFixture};
 pub use http::{
@@ -69,6 +70,7 @@ pub use influxdb::{
     InfluxDbSinkNoMetadataFixture, InfluxDbSinkNsPrecisionFixture, InfluxDbSinkTextFixture,
     InfluxDbSourceFixture, InfluxDbSourceRawFixture, InfluxDbSourceTextFixture,
 };
+pub use meilisearch::{MeilisearchOps, MeilisearchSinkFixture, TEST_INDEX};
 pub use mongodb::{
     MongoDbOps, MongoDbSinkAutoCreateFixture, MongoDbSinkBatchFixture, MongoDbSinkFailpointFixture,
     MongoDbSinkFixture, MongoDbSinkJsonFixture, MongoDbSinkWriteConcernFixture,

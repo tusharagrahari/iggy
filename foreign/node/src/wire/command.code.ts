@@ -22,7 +22,8 @@ export const COMMAND_CODE = {
   Ping: 1,
   GetStats: 10,
   GetSnapshot: 11,                    // @TODO GET_SNAPSHOT_FILE_CODE: u32 = 11
-  GetClusterMetadata: 12,             // GET_CLUSTER_METADATA_CODE: u32 = 12
+  GetClusterMetadata: 12,
+  DescribeOptions: 13,
   GetMe: 20,
   GetClient: 21,
   GetClients: 22,
@@ -68,6 +69,7 @@ export const COMMAND_CODE = {
   DeleteGroup: 603,
   JoinGroup: 604,
   LeaveGroup: 605,
+  SyncGroup: 606,
 };
 
 const reverseCommandCodeMap = reverseRecord(COMMAND_CODE);

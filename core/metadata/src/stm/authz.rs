@@ -56,7 +56,6 @@ use iggy_binary_protocol::requests::users::ChangePasswordRequest;
 use iggy_binary_protocol::{Operation, PrepareHeader, WireDecode, WireIdentifier};
 use iggy_common::{IggyError, variadic};
 use server_common::Message;
-use std::mem::size_of;
 
 /// Gate a committed prepare, then apply it. A denial commits as an
 /// `Unauthorized` no-op (the gate never mutates state); an allow proceeds to
@@ -137,7 +136,7 @@ pub(crate) fn authorize(
     if user_id == ROOT_USER_ID {
         return None;
     }
-    let body = &prepare.as_slice()[size_of::<PrepareHeader>()..header.size as usize];
+    let body = prepare.body();
 
     match header.operation {
         // Streams. `create_stream` is unscoped; the rest resolve the stream id.
@@ -342,9 +341,7 @@ pub(crate) fn authorize(
         | Operation::DeletePersonalAccessToken
         | Operation::SendMessages
         | Operation::StoreConsumerOffset
-        | Operation::DeleteConsumerOffset
-        | Operation::StoreConsumerOffset2
-        | Operation::DeleteConsumerOffset2 => None,
+        | Operation::DeleteConsumerOffset => None,
     }
 }
 
@@ -410,7 +407,7 @@ mod tests {
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::CreateTopicRequest;
     use iggy_binary_protocol::requests::users::CreateUserRequest;
-    use iggy_binary_protocol::{Command2, WireEncode, WireName};
+    use iggy_binary_protocol::{Command, WireEncode, WireName, WireOptions};
     use iggy_common::UserStatus;
     use server_common::iobuf::Owned;
 
@@ -439,7 +436,7 @@ mod tests {
             let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
                 &mut buffer.as_mut_slice()[..HEADER_SIZE],
             );
-            header.command = Command2::Prepare;
+            header.command = Command::Prepare;
             header.operation = operation;
             header.op = op;
             header.user_id = user_id;
@@ -474,6 +471,7 @@ mod tests {
             password: "hash".to_string(),
             status: UserStatus::Active.as_code(),
             permissions: Some(WirePermissions { global, streams }),
+            options: WireOptions::empty(),
         }
         .to_bytes()
     }
@@ -481,6 +479,7 @@ mod tests {
     fn create_stream_body(name: &str) -> bytes::Bytes {
         CreateStreamRequest {
             name: WireName::new(name).unwrap(),
+            options: WireOptions::empty(),
         }
         .to_bytes()
     }
@@ -490,12 +489,10 @@ mod tests {
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(stream_id),
                 partitions_count: 1,
-                compression_algorithm: 0,
-                message_expiry: 0,
-                max_topic_size: 0,
-                replication_factor: 1,
                 name: WireName::new(name).unwrap(),
+                options: WireOptions::empty(),
             },
+            derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
                 partition_id: 0,
                 consensus_group_id: 1,

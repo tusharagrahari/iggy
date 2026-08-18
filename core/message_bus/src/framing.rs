@@ -91,8 +91,12 @@ pub async fn write_message<S: AsyncWriteExt>(
 /// contexts (e.g. `select!`) must accept the resulting framing error
 /// and tear the connection down.
 ///
-/// See `tcp_tls::run_pump` rustdoc and TODO for the resumable-framing
-/// fix path.
+/// Every current caller is a non-cancellable context: the plaintext TCP
+/// reader loops with no `select!` (shutdown arrives via the `SHUT_RD`
+/// watchdog), QUIC reads one frame per dedicated bidi stream, and the
+/// replica handshake is sequential. A pump that must `select!` over the
+/// read instead uses its own resumable accumulator; see
+/// `transports::tcp_tls::run_pump` and its `TlsPumpState`.
 ///
 /// # Errors
 ///
@@ -171,10 +175,10 @@ fn to_read_error(e: &std::io::Error) -> IggyError {
 mod tests {
     use super::*;
     use compio::net::{TcpListener, TcpStream};
-    use iggy_binary_protocol::{Command2, SIZE_FIELD_OFFSET};
+    use iggy_binary_protocol::{Command, SIZE_FIELD_OFFSET};
 
     #[allow(clippy::cast_possible_truncation)]
-    fn make_header_only(command: Command2) -> Message<GenericHeader> {
+    fn make_header_only(command: Command) -> Message<GenericHeader> {
         Message::<GenericHeader>::new(HEADER_SIZE).transmute_header(|_, h: &mut GenericHeader| {
             h.command = command;
             h.size = HEADER_SIZE as u32;
@@ -196,10 +200,10 @@ mod tests {
     #[allow(clippy::future_not_send)]
     async fn write_then_read_header_only() {
         let (mut a, mut b) = local_pair().await;
-        let msg = make_header_only(Command2::Ping);
+        let msg = make_header_only(Command::Ping);
         write_message(&mut a, msg).await.unwrap();
         let read = read_message(&mut b, MAX_MESSAGE_SIZE).await.unwrap();
-        assert_eq!(read.header().command, Command2::Ping);
+        assert_eq!(read.header().command, Command::Ping);
         assert_eq!(read.header().size as usize, HEADER_SIZE);
     }
 

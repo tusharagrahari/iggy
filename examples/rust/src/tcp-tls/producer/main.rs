@@ -25,7 +25,7 @@
 //     IGGY_TCP_TLS_ENABLED=true \
 //     IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
 //     IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
-//     cargo r --bin iggy-server
+//     cargo run --bin iggy-server
 //
 // Run this example (from repo root):
 //   cargo run --example tcp-tls-producer -p iggy_examples
@@ -92,11 +92,11 @@ async fn init_system(client: &IggyClient) -> (u32, u32) {
         .create_topic(
             &Identifier::named(STREAM_NAME).unwrap(),
             TOPIC_NAME,
-            1,
-            CompressionAlgorithm::default(),
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::ServerDefault,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
     {

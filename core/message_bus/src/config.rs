@@ -18,7 +18,7 @@
 //! Runtime tunables for the message bus.
 //!
 //! Single source of truth for these knobs is the on-disk schema
-//! [`configs::server_ng::ServerNgConfig`]. The bus consumes that
+//! [`configs::server::ServerConfig`]. The bus consumes that
 //! schema at construction (see [`crate::IggyMessageBus::with_config`])
 //! and converts the schema-typed fields
 //! ([`iggy_common::IggyDuration`] / [`iggy_common::IggyByteSize`])
@@ -26,14 +26,12 @@
 //! fields directly without per-call conversion.
 //!
 //! The WebSocket frame-layer config the bus consumes lives under the
-//! `[message_bus]` block (`ws_max_message_size`, `ws_max_frame_size`,
-//! `ws_write_buffer_size`, `ws_accept_unmasked_frames`). The schema's
-//! separate `[websocket]` block configures the legacy WS listener and
-//! is not read by the bus; the bus owns its own WS ceiling because the
-//! SDK-client plane has different cardinality and burst characteristics
-//! than the legacy listener (see `configs::server_ng_config::message_bus`).
-//! [`From<&ServerNgConfig> for MessageBusConfig`](MessageBusConfig)
-//! builds [`WebSocketConfig`] from those fields once at boot.
+//! schema's `[websocket]` block (buffer sizes, message / frame
+//! ceilings, unmasked-frame acceptance): the bus IS the server's
+//! WS / WSS install path, so the listener section carries the frame
+//! tuning (see `configs::websocket`).
+//! [`From<&ServerConfig> for MessageBusConfig`](MessageBusConfig)
+//! folds that section into [`WebSocketConfig`] once at boot.
 //!
 //! Liveness detection is NOT done via TCP keepalive on the bus: SDK
 //! clients manage their own keepalive policy at the application layer,
@@ -41,17 +39,17 @@
 //! than by `SO_KEEPALIVE`.
 //!
 //! Neither plane is authenticated at the bus layer: identity and
-//! credential checks belong to the caller (`core/server-ng`) via
+//! credential checks belong to the caller (`core/server`) via
 //! `LOGIN_*` commands. This struct therefore carries no secret /
 //! token-source state.
 
 pub use compio::ws::tungstenite::protocol::WebSocketConfig;
 
-use configs::server_ng::ServerNgConfig;
+use configs::server::ServerConfig;
 use std::time::Duration;
 
 /// Pre-converted QUIC transport tuning derived from
-/// [`ServerNgConfig::quic`](configs::ng_quic::QuicConfig).
+/// [`ServerConfig::quic`](configs::quic::QuicConfig).
 ///
 /// Threaded into [`crate::transports::quic::transport_config_from`] at
 /// every bind site so the schema's `[quic]` block actually drives
@@ -65,18 +63,15 @@ use std::time::Duration;
 ///
 /// Hardcoded knobs the bus does NOT expose: `max_concurrent_uni_streams = 0`
 /// and the CUBIC congestion controller. Both are architectural
-/// invariants of the SDK-client plane (single bidi stream per peer,
-/// no datagram or unidirectional traffic).
+/// invariants of the SDK-client plane (no datagram or unidirectional
+/// traffic).
 #[derive(Debug, Clone)]
 pub struct QuicTuning {
     /// Maximum number of concurrent bidirectional streams per
-    /// connection. The bus opens exactly one per peer; setting this
-    /// above 1 just preallocates unused quinn-proto state.
+    /// connection. Each SDK command opens a fresh bidi stream, so
+    /// this caps how many commands one client connection may have
+    /// in flight; 1 disables pipelining.
     pub max_concurrent_bidi_streams: u32,
-
-    /// Buffer size handed to quinn's outbound datagram queue, in
-    /// bytes.
-    pub datagram_send_buffer_size: usize,
 
     /// Initial path MTU advertised to the peer, in bytes.
     pub initial_mtu: u16,
@@ -86,6 +81,13 @@ pub struct QuicTuning {
 
     /// Receive-flow control window per connection, in bytes.
     pub receive_window: u32,
+
+    /// Receive-flow control window per stream, in bytes. Never above
+    /// [`Self::receive_window`], and equal to it under the shipped
+    /// single-stream default. Setting it strictly below is what keeps
+    /// one unread stream from pinning the whole connection window, so
+    /// it only buys anything once several streams share a connection.
+    pub stream_receive_window: u32,
 
     /// Interval between QUIC keep-alive PINGs. `Duration::ZERO`
     /// disables keep-alive; the connection then relies entirely on
@@ -111,8 +113,8 @@ pub const IOV_MAX_LIMIT: usize = 512;
 /// Pre-converted runtime tunables in effect on a `IggyMessageBus`
 /// instance.
 ///
-/// Built from a fully-validated [`ServerNgConfig`] via
-/// [`From<&ServerNgConfig>`] at boot. All fields are runtime-typed
+/// Built from a fully-validated [`ServerConfig`] via
+/// [`From<&ServerConfig>`] at boot. All fields are runtime-typed
 /// (`Duration`, `usize`, `tungstenite::WebSocketConfig`) so hot paths
 /// read them directly without `.get_duration()` / `.as_bytes_u64()`
 /// conversion.
@@ -179,10 +181,9 @@ pub struct MessageBusConfig {
     /// Threaded into `compio_ws::accept_async_with_config` on the WS
     /// install path and into `WssTransportConn::ws_handshake` for WSS.
     /// Built once at boot by `build_ws_config` (see the
-    /// [`From<&ServerNgConfig> for MessageBusConfig`](MessageBusConfig) impl below)
-    /// from the bus-owned `ws_*` fields under `[message_bus]`. The
-    /// schema's `[websocket]` block is intentionally NOT consulted
-    /// here; see this module's preamble for the rationale.
+    /// [`From<&ServerConfig> for MessageBusConfig`](MessageBusConfig) impl below)
+    /// from the schema's `[websocket]` section, the live frame-tuning
+    /// source for the server's WS plane.
     ///
     /// The [`WebSocketConfig`] type is re-exported from `compio_ws`'s
     /// vendored `tungstenite` so callers do not need a direct dep on
@@ -190,23 +191,23 @@ pub struct MessageBusConfig {
     pub ws_config: WebSocketConfig,
 
     /// QUIC transport tuning, pre-converted from
-    /// [`ServerNgConfig::quic`](configs::ng_quic::QuicConfig) at boot.
+    /// [`ServerConfig::quic`](configs::quic::QuicConfig) at boot.
     pub quic: QuicTuning,
 }
 
-impl From<&ServerNgConfig> for MessageBusConfig {
-    fn from(cfg: &ServerNgConfig) -> Self {
+impl From<&ServerConfig> for MessageBusConfig {
+    fn from(cfg: &ServerConfig) -> Self {
         let bus = &cfg.message_bus;
-        // Production load goes through `ServerNgConfig::validate()`, which
+        // Production load goes through `ServerConfig::validate()`, which
         // already exercises `bus.validate()`. This debug-assert catches
-        // direct callers (tests, simulators) that build a `ServerNgConfig`
+        // direct callers (tests, simulators) that build a `ServerConfig`
         // by hand and forget to validate before converting.
         debug_assert!(
             <configs::message_bus::MessageBusConfig as iggy_common::Validatable<
                 configs::ConfigurationError,
             >>::validate(bus)
             .is_ok(),
-            "MessageBusConfig::from(&ServerNgConfig) called on an unvalidated bus config",
+            "MessageBusConfig::from(&ServerConfig) called on an unvalidated bus config",
         );
         Self {
             max_batch: bus.max_batch,
@@ -222,13 +223,13 @@ impl From<&ServerNgConfig> for MessageBusConfig {
             close_peer_timeout: bus.close_peer_timeout.get_duration(),
             close_grace: bus.close_grace.get_duration(),
             handshake_grace: bus.handshake_grace.get_duration(),
-            ws_config: build_ws_config(bus),
+            ws_config: build_ws_config(&cfg.websocket),
             quic: build_quic_tuning(&cfg.quic),
         }
     }
 }
 
-/// Convert the schema's [`configs::ng_quic::QuicConfig`]
+/// Convert the schema's [`configs::quic::QuicConfig`]
 /// (`IggyByteSize` / `IggyDuration` typed) into the runtime
 /// [`QuicTuning`] (plain integer / `Duration` fields).
 ///
@@ -238,15 +239,15 @@ impl From<&ServerNgConfig> for MessageBusConfig {
 /// `unwrap_or` arms below are still bounded saturations that keep
 /// the build unconditionally infallible if a future caller skips
 /// validation in dev / test code.
-fn build_quic_tuning(quic: &configs::ng_quic::QuicConfig) -> QuicTuning {
+fn build_quic_tuning(quic: &configs::quic::QuicConfig) -> QuicTuning {
     QuicTuning {
         max_concurrent_bidi_streams: u32::try_from(quic.max_concurrent_bidi_streams)
             .unwrap_or(u32::MAX),
-        datagram_send_buffer_size: usize::try_from(quic.datagram_send_buffer_size.as_bytes_u64())
-            .unwrap_or(usize::MAX),
         initial_mtu: u16::try_from(quic.initial_mtu.as_bytes_u64()).unwrap_or(u16::MAX),
         send_window: quic.send_window.as_bytes_u64(),
         receive_window: u32::try_from(quic.receive_window.as_bytes_u64()).unwrap_or(u32::MAX),
+        stream_receive_window: u32::try_from(quic.stream_receive_window.as_bytes_u64())
+            .unwrap_or(u32::MAX),
         keep_alive_interval: quic.keep_alive_interval.get_duration(),
         max_idle_timeout: quic.max_idle_timeout.get_duration(),
     }
@@ -254,47 +255,56 @@ fn build_quic_tuning(quic: &configs::ng_quic::QuicConfig) -> QuicTuning {
 
 impl Default for QuicTuning {
     /// Mirrors the `[quic]` defaults in
-    /// `core/server-ng/config.toml`: 64 MiB send/receive windows,
-    /// 30 s idle timeout, 10 s keep-alive, 8 KiB initial MTU, 100 KiB
-    /// datagram send buffer, single bidi stream per peer.
+    /// `core/server/config.toml`: 64 MiB send/receive windows, a per-stream
+    /// window equal to the connection receive window, 30 s idle timeout, 10 s
+    /// keep-alive, 1200 B initial MTU, one in-flight command per connection.
     ///
     /// Intended for tests and direct callers; production builds
-    /// derive the field from [`ServerNgConfig`] so the values stay in
+    /// derive the field from [`ServerConfig`] so the values stay in
     /// lock-step with the on-disk schema.
     fn default() -> Self {
         Self {
             max_concurrent_bidi_streams: 1,
-            datagram_send_buffer_size: 100 * 1024,
-            initial_mtu: 8 * 1024,
+            initial_mtu: 1200,
             send_window: 64 * 1024 * 1024,
             receive_window: 64 * 1024 * 1024,
+            stream_receive_window: 64 * 1024 * 1024,
             keep_alive_interval: Duration::from_secs(10),
             max_idle_timeout: Duration::from_secs(30),
         }
     }
 }
 
-/// Fold the bus's `ws_*` schema knobs into a single
+/// Fold the schema's `[websocket]` frame-tuning knobs into a single
 /// [`tungstenite::WebSocketConfig`].
 ///
-/// Each `Some` overrides the tungstenite default; `None` keeps the
-/// crate-wide default. Conversion to `usize` saturates on platforms
-/// where `IggyByteSize` would overflow, but the schema validator
-/// already constrains all sizes to fit in `u64`, and on supported
-/// targets `usize` is at least 32 bits, so saturation is unreachable
-/// in practice.
-fn build_ws_config(bus: &configs::message_bus::MessageBusConfig) -> WebSocketConfig {
+/// The standalone `tungstenite` crate may be a different major version
+/// than the one re-exported by `compio_ws`, so the conversion lives in
+/// this crate (next to the `compio_ws` dependency) and constructs the
+/// config through the re-export to guarantee type compatibility.
+///
+/// Each `Some` overrides the compio-ws default; `None` keeps it.
+/// Conversion to `usize` saturates on platforms where `IggyByteSize`
+/// would overflow, but on supported targets `usize` is at least 32
+/// bits, so saturation is unreachable in practice.
+fn build_ws_config(websocket: &configs::websocket::WebSocketConfig) -> WebSocketConfig {
     let mut ws = WebSocketConfig::default();
-    if let Some(sz) = bus.ws_max_message_size {
-        ws = ws.max_message_size(Some(byte_size_to_usize(sz)));
+    if let Some(sz) = websocket.read_buffer_size {
+        ws = ws.read_buffer_size(byte_size_to_usize(sz));
     }
-    if let Some(sz) = bus.ws_max_frame_size {
-        ws = ws.max_frame_size(Some(byte_size_to_usize(sz)));
-    }
-    if let Some(sz) = bus.ws_write_buffer_size {
+    if let Some(sz) = websocket.write_buffer_size {
         ws = ws.write_buffer_size(byte_size_to_usize(sz));
     }
-    ws.accept_unmasked_frames(bus.ws_accept_unmasked_frames)
+    if let Some(sz) = websocket.max_write_buffer_size {
+        ws = ws.max_write_buffer_size(byte_size_to_usize(sz));
+    }
+    if let Some(sz) = websocket.max_message_size {
+        ws = ws.max_message_size(Some(byte_size_to_usize(sz)));
+    }
+    if let Some(sz) = websocket.max_frame_size {
+        ws = ws.max_frame_size(Some(byte_size_to_usize(sz)));
+    }
+    ws.accept_unmasked_frames(websocket.accept_unmasked_frames)
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -305,7 +315,7 @@ fn byte_size_to_usize(sz: iggy_common::IggyByteSize) -> usize {
 
 impl Default for MessageBusConfig {
     fn default() -> Self {
-        Self::from(&ServerNgConfig::default())
+        Self::from(&ServerConfig::default())
     }
 }
 
@@ -315,23 +325,18 @@ mod tests {
 
     /// `QuicTuning::default()` carries hand-coded literals that must
     /// match the schema-derived path through
-    /// `From<&ServerNgConfig> for MessageBusConfig`. If the embedded
+    /// `From<&ServerConfig> for MessageBusConfig`. If the embedded
     /// TOML or the literals drift, every test that uses
     /// `QuicTuning::default()` (e.g. `quic_client_roundtrip`) silently
     /// observes different bytes than production. Pin both sides here.
     #[test]
     fn quic_tuning_default_matches_schema() {
-        let schema_quic = MessageBusConfig::from(&ServerNgConfig::default()).quic;
+        let schema_quic = MessageBusConfig::from(&ServerConfig::default()).quic;
         let literal = QuicTuning::default();
 
         assert_eq!(
             schema_quic.max_concurrent_bidi_streams,
             literal.max_concurrent_bidi_streams
-        );
-        assert_eq!(
-            schema_quic.datagram_send_buffer_size, literal.datagram_send_buffer_size,
-            "schema datagram_send_buffer_size {} bytes vs literal {} bytes",
-            schema_quic.datagram_send_buffer_size, literal.datagram_send_buffer_size
         );
         assert_eq!(
             schema_quic.initial_mtu, literal.initial_mtu,
@@ -340,6 +345,10 @@ mod tests {
         );
         assert_eq!(schema_quic.send_window, literal.send_window);
         assert_eq!(schema_quic.receive_window, literal.receive_window);
+        assert_eq!(
+            schema_quic.stream_receive_window,
+            literal.stream_receive_window
+        );
         assert_eq!(schema_quic.keep_alive_interval, literal.keep_alive_interval);
         assert_eq!(schema_quic.max_idle_timeout, literal.max_idle_timeout);
     }

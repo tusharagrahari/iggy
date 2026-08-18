@@ -17,6 +17,7 @@
 
 use crate::permissioner::Permissioner;
 use crate::stm::StateHandler;
+use crate::stm::id_slab::IdSlab;
 use crate::stm::result::{
     ApplyReply, ChangePasswordResult, CreatePersonalAccessTokenResult, CreateUserResult,
     DeletePersonalAccessTokenResult, DeleteUserResult, UpdatePermissionsResult, UpdateUserResult,
@@ -34,14 +35,14 @@ use iggy_binary_protocol::requests::users::{
 };
 use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
-use iggy_binary_protocol::{WireIdentifier, WireName};
+use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions};
 use iggy_common::defaults::{DEFAULT_ROOT_USER_ID, MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
+use iggy_common::wire_conversions::resource_options_from_wire;
 use iggy_common::{
     GlobalPermissions, IggyError, IggyExpiry, IggyTimestamp, Permissions, PersonalAccessToken,
-    StreamPermissions, UserId, UserStatus,
+    ResourceOptions, StreamPermissions, UserId, UserStatus,
 };
 use serde::{Deserialize, Serialize};
-use slab::Slab;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -57,6 +58,7 @@ pub struct User {
     pub status: UserStatus,
     pub created_at: IggyTimestamp,
     pub permissions: Option<Arc<Permissions>>,
+    pub options: ResourceOptions,
 }
 
 impl Default for User {
@@ -68,6 +70,7 @@ impl Default for User {
             status: UserStatus::default(),
             created_at: IggyTimestamp::default(),
             permissions: None,
+            options: ResourceOptions::new(),
         }
     }
 }
@@ -88,6 +91,7 @@ impl User {
             status,
             created_at,
             permissions,
+            options: ResourceOptions::new(),
         }
     }
 }
@@ -95,7 +99,7 @@ impl User {
 define_state! {
     Users {
         index: AHashMap<Arc<str>, UserId>,
-        items: Slab<User>,
+        items: IdSlab<User>,
         personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>>,
         // SAFETY: deterministic-apply invariant. `AHashMap` iteration order
         // differs across replicas (random seed), so this map MUST only be
@@ -125,7 +129,10 @@ collect_handlers! {
 }
 
 impl UsersInner {
-    pub(crate) fn resolve_user_id(&self, identifier: &WireIdentifier) -> Option<usize> {
+    /// Resolve a wire user identifier to its committed slab id, `None` when
+    /// the user does not exist.
+    #[must_use]
+    pub fn resolve_user_id(&self, identifier: &WireIdentifier) -> Option<usize> {
         match identifier {
             WireIdentifier::Numeric(id) => {
                 let id = *id as usize;
@@ -205,6 +212,18 @@ impl UsersInner {
         tokens.sort_by(|(left, _), (right, _)| left.cmp(right));
         tokens
     }
+
+    /// Count of live personal access tokens for one user.
+    ///
+    /// Single-map read for the ingress-side create cap; the sibling
+    /// `personal_access_tokens_of` allocates and sorts, too heavy for a
+    /// per-request check.
+    #[must_use]
+    pub fn pat_count_of(&self, user_id: UserId) -> usize {
+        self.personal_access_tokens
+            .get(&user_id)
+            .map_or(0, |user_tokens| user_tokens.len())
+    }
 }
 
 impl Users {
@@ -255,7 +274,7 @@ impl Users {
             "root username length {length} outside {MIN_USERNAME_LENGTH}..={MAX_USERNAME_LENGTH}; fix IGGY_ROOT_USERNAME"
         );
 
-        // Boot-only invariant: server-ng calls this before listeners and
+        // Boot-only invariant: the server calls this before listeners and
         // consensus traffic start, on shard 0 initialization. The read/apply
         // split cannot race another user creation in that phase.
         let username = WireName::new(username).expect("root username must be valid");
@@ -287,6 +306,7 @@ impl Users {
                         },
                         streams: Vec::new(),
                     }),
+                    options: WireOptions::empty(),
                 },
                 IggyTimestamp::from(1),
             ))
@@ -428,6 +448,9 @@ impl StateHandler for CreateUserRequest {
             .permissions
             .as_ref()
             .map(|p| Arc::new(Permissions::from(p.clone())));
+        let Ok(options) = resource_options_from_wire(&self.options, true) else {
+            return ApplyReply::err(CreateUserResult::InvalidOptionValue);
+        };
 
         let user = User {
             id: 0,
@@ -436,6 +459,7 @@ impl StateHandler for CreateUserRequest {
             status,
             created_at: timestamp,
             permissions,
+            options,
         };
 
         let id = state.items.insert(user);
@@ -462,6 +486,7 @@ impl StateHandler for CreateUserRequest {
                     created_at: timestamp.as_micros(),
                     status: self.status,
                     username: self.username.clone(),
+                    options: self.options.clone(),
                 },
                 permissions: self.permissions.clone(),
             }
@@ -480,6 +505,12 @@ impl StateHandler for UpdateUserRequest {
 
         let Some(user) = state.items.get_mut(user_id) else {
             return ApplyReply::err(UpdateUserResult::UserNotFound);
+        };
+
+        // Decoded before any mutation: a malformed block must leave the user
+        // untouched rather than half-renamed.
+        let Ok(updated_options) = resource_options_from_wire(&self.options, true) else {
+            return ApplyReply::err(UpdateUserResult::InvalidOptionValue);
         };
 
         if let Some(new_username) = &self.username {
@@ -506,6 +537,9 @@ impl StateHandler for UpdateUserRequest {
         {
             user.status = new_status;
         }
+        // Patch, never replace: keys the client did not send keep their
+        // current value, so a client that predates a key cannot erase it.
+        user.options.extend(updated_options);
         ApplyReply::ok(Bytes::new())
     }
 }
@@ -559,11 +593,11 @@ impl StateHandler for ChangePasswordRequest {
         };
 
         // An empty `new_password` is the primary's signal that the caller's
-        // current password did not match (see server-ng
+        // current password did not match (see the server
         // `verify_and_rewrite_change_password`): the accept path always
         // replicates a non-empty Argon2 hash, so this is unambiguous. Rejecting
         // here (rather than denying pre-consensus) commits the op as a no-op,
-        // keeping the client's request sequence contiguous in the ClientTable.
+        // recording the request id in the ClientTable so a retry of it dedups.
         if self.new_password.is_empty() {
             return ApplyReply::err(ChangePasswordResult::InvalidCredentials);
         }
@@ -605,11 +639,21 @@ impl StateHandler for UpdatePermissionsRequest {
     }
 }
 
-// TODO(hubcio): Serialize proper reply (e.g. generated raw token from the
-// primary-side mint) instead of empty Bytes. The raw token is currently
-// generated only at the request-rewrite step on the primary and dropped;
-// surfacing it back to the client needs a side-channel out of
-// `maybe_rewrite_pat_request`.
+/// The success reply here is deliberately empty: the raw token the caller needs
+/// is the one thing this apply must never see.
+///
+/// The primary mints the raw token and its hash at ingress (server-ng
+/// `pat::rewrite_pat_request_for_user`) and replicates only the hash. Minting
+/// inside this apply would call `ring::rand` on every replica and diverge the
+/// token index, and replicating the raw token would persist a live credential in
+/// every WAL and snapshot. So the raw token leaves the primary by a side channel
+/// (`maybe_rewrite_pat_request` returns it alongside the rewritten request) and
+/// the home shard splices it into this op's reply as a typed
+/// `RawPersonalAccessTokenResponse` (server-ng `responses::build_raw_pat_reply`).
+///
+/// One consequence rides on that: the secret exists only on the wire of the
+/// original reply, so a replayed request cannot be served from the client-table
+/// cache. `impls::metadata::unreplayable_secret_refusal` refuses it instead.
 impl StateHandler for CreatePersonalAccessTokenRequest {
     type State = UsersInner;
     fn apply(&self, state: &mut UsersInner, timestamp: IggyTimestamp) -> ApplyReply {
@@ -708,6 +752,8 @@ pub struct UserSnapshot {
     pub status: UserStatus,
     pub created_at: IggyTimestamp,
     pub permissions: Option<Permissions>,
+    #[serde(default)]
+    pub options: ResourceOptions,
 }
 
 /// Personal access token snapshot representation for serialization.
@@ -731,6 +777,11 @@ pub struct PermissionerSnapshot {
 }
 
 /// Snapshot representation for the Users state machine.
+///
+/// Serialized-form invariant (see [`crate::stm::snapshot::MetadataSnapshot`]):
+/// `items`, `personal_access_tokens`, and the permissioner's maps stay ordered
+/// (`Vec` / `BTreeMap`) even though the runtime holds them in `AHashMap`s. Swapping
+/// any to an unordered map breaks the checkpoint checksum cross-check.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsersSnapshot {
     pub items: Vec<(usize, UserSnapshot)>,
@@ -756,6 +807,7 @@ impl Snapshotable for Users {
                             status: user.status,
                             created_at: user.created_at,
                             permissions: user.permissions.as_ref().map(|p| (**p).clone()),
+                            options: user.options.clone(),
                         },
                     )
                 })
@@ -806,10 +858,29 @@ impl Snapshotable for Users {
         })
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     fn from_snapshot(
         snapshot: Self::Snapshot,
     ) -> Result<Self, crate::stm::snapshot::SnapshotError> {
+        Ok(UsersInner::inner_from_snapshot(snapshot).into())
+    }
+}
+
+impl UsersInner {
+    /// Rebuild from a snapshot section IN PLACE (state transfer), absorbed on
+    /// both left-right buffers.
+    ///
+    /// Nothing here is shared across buffers the way `StreamsInner`'s stats
+    /// registry is, so a wholesale replace is correct.
+    pub(crate) fn restore_in_place(&mut self, snapshot: UsersSnapshot) {
+        *self = Self::inner_from_snapshot(snapshot);
+    }
+
+    /// Build a complete `UsersInner` from a snapshot section. Shared by
+    /// wrapper construction ([`Snapshotable::from_snapshot`]) and the
+    /// in-place restore command (state transfer), which absorbs it on both
+    /// left-right buffers.
+    #[allow(clippy::cast_possible_truncation)]
+    pub(crate) fn inner_from_snapshot(snapshot: UsersSnapshot) -> Self {
         let mut index: AHashMap<Arc<str>, UserId> = AHashMap::new();
         let mut user_entries: Vec<(usize, User)> = Vec::new();
 
@@ -822,13 +893,14 @@ impl Snapshotable for Users {
                 status: user_snap.status,
                 created_at: user_snap.created_at,
                 permissions: user_snap.permissions.map(Arc::new),
+                options: user_snap.options,
             };
 
             index.insert(username, slab_key as UserId);
             user_entries.push((slab_key, user));
         }
 
-        let items: Slab<User> = user_entries.into_iter().collect();
+        let items: IdSlab<User> = user_entries.into_iter().collect();
 
         let mut personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>> =
             AHashMap::new();
@@ -869,7 +941,7 @@ impl Snapshotable for Users {
                 .init_permissions_for_user(user_id as UserId, user.permissions.as_deref().cloned());
         }
 
-        let inner = UsersInner {
+        Self {
             index,
             items,
             personal_access_tokens,
@@ -877,8 +949,7 @@ impl Snapshotable for Users {
             personal_access_token_expiry_index,
             permissioner,
             last_result: None,
-        };
-        Ok(inner.into())
+        }
     }
 }
 
@@ -948,6 +1019,32 @@ mod tests {
 
         assert!(users.personal_access_tokens[&5].is_empty());
         assert!(users.personal_access_token_index.is_empty());
+    }
+
+    #[test]
+    fn pat_count_of_tracks_create_and_delete() {
+        let mut users = UsersInner::new();
+        assert_eq!(users.pat_count_of(9), 0);
+
+        for (name, hash_byte) in [("first", b'a'), ("second", b'b')] {
+            CreatePersonalAccessTokenRequest {
+                user_id: 9,
+                name: WireName::new(name).unwrap(),
+                expiry: 0,
+                token_hash: [hash_byte; PAT_TOKEN_HASH_BYTES],
+            }
+            .apply(&mut users, IggyTimestamp::now());
+        }
+        assert_eq!(users.pat_count_of(9), 2);
+        assert_eq!(users.pat_count_of(1), 0, "count is scoped per user");
+
+        DeletePersonalAccessTokenRequest {
+            user_id: 9,
+            name: WireName::new("first").unwrap(),
+            only_if_expired: false,
+        }
+        .apply(&mut users, IggyTimestamp::now());
+        assert_eq!(users.pat_count_of(9), 1);
     }
 
     #[test]
@@ -1077,12 +1174,51 @@ mod tests {
         );
     }
 
+    /// User ids come from `items.insert`, and the free list is not part of
+    /// `UsersSnapshot`, so the next `CreateUser` id depended on local delete
+    /// order rather than committed state. A restored replica would hand a
+    /// different id to the same log entry, forking the users table and every
+    /// permission keyed off it.
+    #[test]
+    fn given_descending_deletes_when_round_tripping_a_snapshot_should_keep_the_next_user_id() {
+        let mut users = UsersInner::new();
+        for username in ["alpha", "bravo", "charlie", "delta"] {
+            create_user(&mut users, username);
+        }
+        // Key 0 is the protected root user, so holes go above it. The highest
+        // key stays occupied, or the holes are trailing and a rebuild agrees.
+        let keys: Vec<usize> = users.items.iter().map(|(key, _)| key).collect();
+        let last = keys.len() - 1;
+        for user_id in [keys[last - 1], keys[last - 2]] {
+            let request = DeleteUserRequest {
+                user_id: WireIdentifier::numeric(u32::try_from(user_id).unwrap()),
+            };
+            assert_eq!(
+                StateHandler::apply(&request, &mut users, IggyTimestamp::now()).code,
+                0,
+                "user {user_id} must delete"
+            );
+        }
+        let before = users.items.vacant_key();
+
+        let snapshot = Users::from(users.clone()).to_snapshot();
+        let restored = UsersInner::inner_from_snapshot(snapshot);
+
+        assert_eq!(
+            restored.items.vacant_key(),
+            before,
+            "the id the next CreateUser is assigned must not depend on whether \
+             a snapshot was restored in between"
+        );
+    }
+
     fn create_user(users: &mut UsersInner, username: &str) {
         let request = CreateUserRequest {
             username: WireName::new(username).unwrap(),
             password: "hash".to_owned(),
             status: 1,
             permissions: None,
+            options: WireOptions::empty(),
         };
         let apply = StateHandler::apply(&request, users, IggyTimestamp::now());
         assert_eq!(apply.code, 0);
@@ -1097,6 +1233,7 @@ mod tests {
             password: "hash".to_owned(),
             status: 1,
             permissions: None,
+            options: WireOptions::empty(),
         };
         let apply = StateHandler::apply(&request, &mut users, IggyTimestamp::now());
         assert_eq!(apply.code, u32::from(CreateUserResult::UserAlreadyExists));
@@ -1230,6 +1367,7 @@ mod tests {
             password: "hash".to_owned(),
             status: 1,
             permissions,
+            options: WireOptions::empty(),
         };
         let reply = StateHandler::apply(&request, users, IggyTimestamp::now());
         assert_eq!(reply.code, 0);
@@ -1465,6 +1603,7 @@ mod tests {
                 password: "hash".to_owned(),
                 status: 1,
                 permissions: None,
+                options: WireOptions::empty(),
             };
             let reply = StateHandler::apply(&request, &mut users, IggyTimestamp::now());
             assert_eq!(reply.code, u32::from(CreateUserResult::InvalidUsername));
@@ -1480,6 +1619,7 @@ mod tests {
             password: "hash".to_owned(),
             status: 1,
             permissions: None,
+            options: WireOptions::empty(),
         };
         let reply = StateHandler::apply(&request, &mut users, IggyTimestamp::now());
         assert_eq!(reply.code, 0);
@@ -1497,6 +1637,7 @@ mod tests {
             user_id: WireIdentifier::numeric(alice_id),
             username: Some(WireName::new(&short).unwrap()),
             status: None,
+            options: WireOptions::empty(),
         };
         let reply = StateHandler::apply(&rename, &mut users, IggyTimestamp::now());
         assert_eq!(reply.code, u32::from(UpdateUserResult::InvalidUsername));

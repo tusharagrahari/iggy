@@ -27,14 +27,18 @@
 //! offset -- making a metadata->offset purge unnecessary for correctness.
 
 use crate::stm::StateHandler;
-use crate::stm::result::{ApplyReply, CreateConsumerGroupResult, DeleteConsumerGroupResult};
+use crate::stm::id_slab::IdSlab;
+use crate::stm::result::{
+    ApplyReply, CreateConsumerGroupResult, DeleteConsumerGroupResult, JoinConsumerGroupResult,
+    LeaveConsumerGroupResult,
+};
 use crate::stm::stream::StreamsInner;
 use bytes::Bytes;
 
 use bytes::{BufMut, BytesMut};
 use iggy_binary_protocol::WireIdentifier;
 use iggy_binary_protocol::codec::{
-    WireDecode, WireEncode, capped_capacity, read_u32_le, read_u64_le, read_u128_le,
+    WireDecode, WireEncode, bounded_capacity, read_u32_le, read_u64_le, read_u128_le,
 };
 use iggy_binary_protocol::requests::consumer_groups::{
     CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
@@ -42,7 +46,6 @@ use iggy_binary_protocol::requests::consumer_groups::{
 use iggy_binary_protocol::responses::consumer_groups::consumer_group_response::ConsumerGroupResponse;
 use iggy_binary_protocol::responses::consumer_groups::get_consumer_group::ConsumerGroupDetailsResponse;
 use serde::{Deserialize, Serialize};
-use slab::Slab;
 use std::sync::Arc;
 
 /// A partition being cooperatively handed off from this member to `target`.
@@ -117,7 +120,7 @@ pub struct ConsumerGroup {
     /// when it advances.
     pub generation: u64,
     pub name: Arc<str>,
-    pub members: Slab<ConsumerGroupMember>,
+    pub members: IdSlab<ConsumerGroupMember>,
 }
 
 impl ConsumerGroup {
@@ -127,7 +130,7 @@ impl ConsumerGroup {
             id,
             generation: 0,
             name,
-            members: Slab::new(),
+            members: IdSlab::new(),
         }
     }
 
@@ -432,7 +435,7 @@ impl WireDecode for JoinConsumerGroupRequest {
         // corrupt/bit-rotted count (near u32::MAX) allocate gigabytes and abort
         // every backup that applies it.
         let mut in_flight =
-            Vec::with_capacity(capped_capacity(count, buf.len().saturating_sub(pos), 4));
+            Vec::with_capacity(bounded_capacity(count, buf.len().saturating_sub(pos), 4));
         for _ in 0..count {
             in_flight.push(read_u32_le(buf, pos)?);
             pos += 4;
@@ -560,22 +563,29 @@ impl StateHandler for DeleteConsumerGroupRequest {
         state: &mut StreamsInner,
         _timestamp: iggy_common::IggyTimestamp,
     ) -> ApplyReply {
-        let removed = {
-            let Some(topic) = state.topic_mut(&self.stream_id, &self.topic_id) else {
-                return ApplyReply::err(DeleteConsumerGroupResult::NotFound);
-            };
-            if let Some(group_id) = topic.resolve_group_id(&self.group_id)
-                && let Some(group) = topic.consumer_groups.remove(&group_id)
-            {
-                topic.consumer_group_index.remove(&group.name);
-                true
-            } else {
-                false
-            }
+        // Same level-by-level resolution as Join/Leave, mirroring the legacy
+        // `resolve_consumer_group` ladder instead of collapsing a missing
+        // stream or topic into the group-not-found code.
+        let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+            return ApplyReply::err(DeleteConsumerGroupResult::StreamNotFound);
         };
-        if !removed {
-            return ApplyReply::err(DeleteConsumerGroupResult::NotFound);
-        }
+        let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
+            return ApplyReply::err(DeleteConsumerGroupResult::TopicNotFound);
+        };
+        let Some(topic) = state
+            .items
+            .get_mut(stream_id)
+            .and_then(|stream| stream.topics.get_mut(topic_id))
+        else {
+            return ApplyReply::err(DeleteConsumerGroupResult::TopicNotFound);
+        };
+        let Some(group_id) = topic.resolve_group_id(&self.group_id) else {
+            return ApplyReply::err(DeleteConsumerGroupResult::ConsumerGroupNotFound);
+        };
+        let Some(group) = topic.consumer_groups.remove(&group_id) else {
+            return ApplyReply::err(DeleteConsumerGroupResult::ConsumerGroupNotFound);
+        };
+        topic.consumer_group_index.remove(&group.name);
         // Bump the partition-shaping revision so the reconciler's fast-skip
         // doesn't pass over the delete: it reclaims the group's leftover
         // offsets on the topic's surviving partitions.
@@ -589,17 +599,30 @@ impl StateHandler for DeleteConsumerGroupRequest {
 impl StateHandler for JoinConsumerGroupRequest {
     type State = StreamsInner;
     fn apply(&self, state: &mut StreamsInner, timestamp: iggy_common::IggyTimestamp) -> ApplyReply {
-        let Some(topic) = state.topic_mut(&self.stream_id, &self.topic_id) else {
-            return ApplyReply::ok(Bytes::new());
+        // Resolve level by level so the committed rejection names the level that
+        // missed, mirroring the legacy `resolve_consumer_group` ladder instead of
+        // the old silent-OK no-op.
+        let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+            return ApplyReply::err(JoinConsumerGroupResult::StreamNotFound);
+        };
+        let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
+            return ApplyReply::err(JoinConsumerGroupResult::TopicNotFound);
+        };
+        let Some(topic) = state
+            .items
+            .get_mut(stream_id)
+            .and_then(|stream| stream.topics.get_mut(topic_id))
+        else {
+            return ApplyReply::err(JoinConsumerGroupResult::TopicNotFound);
         };
         let Some(group_id) = topic.resolve_group_id(&self.group_id) else {
-            return ApplyReply::ok(Bytes::new());
+            return ApplyReply::err(JoinConsumerGroupResult::ConsumerGroupNotFound);
         };
         // Snapshot the live partition ids before taking a mutable borrow of the
         // group (both borrow the topic).
         let partition_ids: Vec<usize> = topic.partitions.iter().map(|p| p.id).collect();
         let Some(group) = topic.consumer_groups.get_mut(&group_id) else {
-            return ApplyReply::ok(Bytes::new());
+            return ApplyReply::err(JoinConsumerGroupResult::ConsumerGroupNotFound);
         };
         // Idempotent: a re-join from the same client keeps its membership.
         let already = group
@@ -633,26 +656,43 @@ impl StateHandler for LeaveConsumerGroupRequest {
         state: &mut StreamsInner,
         _timestamp: iggy_common::IggyTimestamp,
     ) -> ApplyReply {
-        let Some(topic) = state.topic_mut(&self.stream_id, &self.topic_id) else {
-            return ApplyReply::ok(Bytes::new());
+        // Same level-by-level resolution as Join, surfacing a loud rejection
+        // instead of the old silent-OK no-op when a level is gone.
+        let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
+            return ApplyReply::err(LeaveConsumerGroupResult::StreamNotFound);
+        };
+        let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
+            return ApplyReply::err(LeaveConsumerGroupResult::TopicNotFound);
+        };
+        let Some(topic) = state
+            .items
+            .get_mut(stream_id)
+            .and_then(|stream| stream.topics.get_mut(topic_id))
+        else {
+            return ApplyReply::err(LeaveConsumerGroupResult::TopicNotFound);
         };
         let Some(group_id) = topic.resolve_group_id(&self.group_id) else {
-            return ApplyReply::ok(Bytes::new());
+            return ApplyReply::err(LeaveConsumerGroupResult::ConsumerGroupNotFound);
         };
         let partition_ids: Vec<usize> = topic.partitions.iter().map(|p| p.id).collect();
         let Some(group) = topic.consumer_groups.get_mut(&group_id) else {
-            return ApplyReply::ok(Bytes::new());
+            return ApplyReply::err(LeaveConsumerGroupResult::ConsumerGroupNotFound);
         };
         let member_key = group
             .members
             .iter()
             .find(|(_, m)| m.client_id == self.client_id)
             .map(|(key, _)| key);
-        if let Some(key) = member_key {
-            group.members.remove(key);
-            group.rebalance_members(&partition_ids);
-            state.recompute_pending_revocations_count();
-        }
+        let Some(key) = member_key else {
+            // Group exists but this client never joined it: mirror legacy's
+            // ConsumerGroupMemberNotFound instead of a silent no-op. The
+            // server-internal RemoveConsumerGroupMember (disconnect cleanup)
+            // stays idempotent -- only this client-facing Leave is loud.
+            return ApplyReply::err(LeaveConsumerGroupResult::ConsumerGroupMemberNotFound);
+        };
+        group.members.remove(key);
+        group.rebalance_members(&partition_ids);
+        state.recompute_pending_revocations_count();
         ApplyReply::ok(Bytes::new())
     }
 }
@@ -870,7 +910,7 @@ impl ConsumerGroupSnapshot {
 
     #[must_use]
     pub fn into_group(self) -> ConsumerGroup {
-        let members: Slab<ConsumerGroupMember> = self
+        let members: IdSlab<ConsumerGroupMember> = self
             .members
             .into_iter()
             .map(|(member_key, member_snap)| {
@@ -907,12 +947,12 @@ impl ConsumerGroupSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy_binary_protocol::WireName;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest,
     };
+    use iggy_binary_protocol::{WireName, WireOptions};
     use iggy_common::IggyTimestamp;
 
     // Groups co-locate in the topic node, so an apply resolves its parent through
@@ -923,6 +963,7 @@ mod tests {
         let _ = StateHandler::apply(
             &CreateStreamRequest {
                 name: WireName::new("stream").unwrap(),
+                options: WireOptions::empty(),
             },
             &mut inner,
             IggyTimestamp::now(),
@@ -931,12 +972,10 @@ mod tests {
             request: CreateTopicRequest {
                 stream_id: WireIdentifier::numeric(0),
                 partitions_count: 1,
-                compression_algorithm: 0,
-                message_expiry: 0,
-                max_topic_size: 0,
-                replication_factor: 1,
                 name: WireName::new("topic").unwrap(),
+                options: WireOptions::empty(),
             },
+            derived_options: WireOptions::empty(),
             partitions: vec![CreatedPartitionAssignment {
                 partition_id: 0,
                 consensus_group_id: 1,
@@ -952,6 +991,45 @@ mod tests {
                 stream_id: WireIdentifier::numeric(0),
                 topic_id: WireIdentifier::numeric(0),
                 name: WireName::new(name).unwrap(),
+            },
+            state,
+            IggyTimestamp::now(),
+        )
+    }
+
+    fn join(
+        state: &mut StreamsInner,
+        stream: u32,
+        topic: u32,
+        group: u32,
+        client_id: u128,
+    ) -> ApplyReply {
+        StateHandler::apply(
+            &JoinConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(stream),
+                topic_id: WireIdentifier::numeric(topic),
+                group_id: WireIdentifier::numeric(group),
+                client_id,
+                in_flight: Vec::new(),
+            },
+            state,
+            IggyTimestamp::now(),
+        )
+    }
+
+    fn leave(
+        state: &mut StreamsInner,
+        stream: u32,
+        topic: u32,
+        group: u32,
+        client_id: u128,
+    ) -> ApplyReply {
+        StateHandler::apply(
+            &LeaveConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(stream),
+                topic_id: WireIdentifier::numeric(topic),
+                group_id: WireIdentifier::numeric(group),
+                client_id,
             },
             state,
             IggyTimestamp::now(),
@@ -1018,7 +1096,149 @@ mod tests {
             &mut state,
             IggyTimestamp::now(),
         );
-        assert_eq!(apply.code, u32::from(DeleteConsumerGroupResult::NotFound));
+        assert_eq!(
+            apply.code,
+            u32::from(DeleteConsumerGroupResult::ConsumerGroupNotFound)
+        );
+        assert!(apply.body.is_empty());
+    }
+
+    #[test]
+    fn given_missing_levels_when_apply_delete_consumer_group_should_mirror_resolution_ladder() {
+        let mut state = streams_with_topic();
+        let missing_stream = StateHandler::apply(
+            &DeleteConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(999),
+                topic_id: WireIdentifier::numeric(0),
+                group_id: WireIdentifier::numeric(0),
+            },
+            &mut state,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(
+            missing_stream.code,
+            u32::from(DeleteConsumerGroupResult::StreamNotFound)
+        );
+
+        let missing_topic = StateHandler::apply(
+            &DeleteConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(999),
+                group_id: WireIdentifier::numeric(0),
+            },
+            &mut state,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(
+            missing_topic.code,
+            u32::from(DeleteConsumerGroupResult::TopicNotFound)
+        );
+    }
+
+    #[test]
+    fn given_existing_group_when_apply_join_consumer_group_should_succeed() {
+        let mut state = streams_with_topic();
+        assert_eq!(create_group(&mut state, "group").code, 0);
+
+        // Group ids are 0-based, so the group just created resolves as id 0.
+        let apply = join(&mut state, 0, 0, 0, 1);
+        assert_eq!(apply.code, 0);
+        assert!(apply.body.is_empty());
+
+        // A re-join from the same client is an idempotent success.
+        assert_eq!(join(&mut state, 0, 0, 0, 1).code, 0);
+    }
+
+    #[test]
+    fn given_missing_stream_when_apply_join_consumer_group_should_return_stream_not_found() {
+        let mut state = streams_with_topic();
+        let apply = join(&mut state, 999, 0, 0, 1);
+        assert_eq!(
+            apply.code,
+            u32::from(JoinConsumerGroupResult::StreamNotFound)
+        );
+        assert!(apply.body.is_empty());
+    }
+
+    #[test]
+    fn given_missing_topic_when_apply_join_consumer_group_should_return_topic_not_found() {
+        let mut state = streams_with_topic();
+        let apply = join(&mut state, 0, 999, 0, 1);
+        assert_eq!(
+            apply.code,
+            u32::from(JoinConsumerGroupResult::TopicNotFound)
+        );
+        assert!(apply.body.is_empty());
+    }
+
+    #[test]
+    fn given_missing_group_when_apply_join_consumer_group_should_return_consumer_group_not_found() {
+        let mut state = streams_with_topic();
+        let apply = join(&mut state, 0, 0, 999, 1);
+        assert_eq!(
+            apply.code,
+            u32::from(JoinConsumerGroupResult::ConsumerGroupNotFound)
+        );
+        assert!(apply.body.is_empty());
+    }
+
+    #[test]
+    fn given_joined_member_when_apply_leave_consumer_group_should_succeed() {
+        let mut state = streams_with_topic();
+        assert_eq!(create_group(&mut state, "group").code, 0);
+        assert_eq!(join(&mut state, 0, 0, 0, 1).code, 0);
+
+        let apply = leave(&mut state, 0, 0, 0, 1);
+        assert_eq!(apply.code, 0);
+        assert!(apply.body.is_empty());
+    }
+
+    #[test]
+    fn given_absent_member_when_apply_leave_consumer_group_should_return_member_not_found() {
+        let mut state = streams_with_topic();
+        assert_eq!(create_group(&mut state, "group").code, 0);
+        assert_eq!(join(&mut state, 0, 0, 0, 1).code, 0);
+
+        // Client 2 is not a member of the group, which does exist.
+        let apply = leave(&mut state, 0, 0, 0, 2);
+        assert_eq!(
+            apply.code,
+            u32::from(LeaveConsumerGroupResult::ConsumerGroupMemberNotFound)
+        );
+        assert!(apply.body.is_empty());
+    }
+
+    #[test]
+    fn given_missing_stream_when_apply_leave_consumer_group_should_return_stream_not_found() {
+        let mut state = streams_with_topic();
+        let apply = leave(&mut state, 999, 0, 0, 1);
+        assert_eq!(
+            apply.code,
+            u32::from(LeaveConsumerGroupResult::StreamNotFound)
+        );
+        assert!(apply.body.is_empty());
+    }
+
+    #[test]
+    fn given_missing_topic_when_apply_leave_consumer_group_should_return_topic_not_found() {
+        let mut state = streams_with_topic();
+        let apply = leave(&mut state, 0, 999, 0, 1);
+        assert_eq!(
+            apply.code,
+            u32::from(LeaveConsumerGroupResult::TopicNotFound)
+        );
+        assert!(apply.body.is_empty());
+    }
+
+    #[test]
+    fn given_missing_group_when_apply_leave_consumer_group_should_return_consumer_group_not_found()
+    {
+        let mut state = streams_with_topic();
+        let apply = leave(&mut state, 0, 0, 999, 1);
+        assert_eq!(
+            apply.code,
+            u32::from(LeaveConsumerGroupResult::ConsumerGroupNotFound)
+        );
         assert!(apply.body.is_empty());
     }
 }

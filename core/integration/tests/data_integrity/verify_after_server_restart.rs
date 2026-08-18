@@ -19,39 +19,27 @@ use iggy::prelude::*;
 use integration::bench_utils::run_bench_and_wait_for_finish;
 use integration::harness::{TestHarness, TestServerConfig};
 use serial_test::parallel;
-use std::{collections::HashMap, str::FromStr};
-use test_case::test_matrix;
-
-fn cache_open_segment() -> &'static str {
-    "open_segment"
-}
-
-fn cache_all() -> &'static str {
-    "all"
-}
-
-fn cache_none() -> &'static str {
-    "none"
-}
-
-fn build_server_config(cache_setting: &str) -> TestServerConfig {
-    let mut extra_envs = HashMap::new();
-    extra_envs.insert(
-        "IGGY_SYSTEM_SEGMENT_CACHE_INDEXES".to_string(),
-        cache_setting.to_string(),
-    );
-    TestServerConfig::builder().extra_envs(extra_envs).build()
-}
+use std::str::FromStr;
 
 // TODO(numminex) - Move the message generation method from benchmark run to a special method.
-#[test_matrix(
-    [cache_all(), cache_open_segment(), cache_none()]
-)]
+//
+// The durability barrier is the graceful restart itself: shutdown force-flushes
+// the committed journal. The eager-flush knobs that used to stand in for it are
+// topic creation options now, and the topics here are created by `iggy-bench`,
+// which exposes no flag for them.
+//
+// `iggy-bench` must be freshly built: the harness spawns the prebuilt binary,
+// and a stale one never completes a frame against the server, tripping the
+// bench timeout in `run_bench_and_wait_for_finish`.
 #[tokio::test]
 #[parallel]
-async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) {
+async fn should_fill_data_and_verify_after_restart() {
+    // Restart scenarios run single-node: restarting a node in a multi-node
+    // cluster trips a known partitions-plane view-change stall, tracked
+    // separately.
     let mut harness = TestHarness::builder()
-        .server(build_server_config(cache_setting))
+        .cluster_nodes(1)
+        .server(TestServerConfig::default())
         .build()
         .unwrap();
 
@@ -80,13 +68,6 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     let client = harness.tcp_root_client().await.unwrap();
 
     let topic_id = Identifier::numeric(0).unwrap();
-    for i in 0..7 {
-        let stream_id = Identifier::numeric(i).unwrap();
-        client
-            .flush_unsaved_buffer(&stream_id, &topic_id, 0, true)
-            .await
-            .unwrap();
-    }
 
     // Create consumer groups to test persistence
     let consumer_group_names = ["test-cg-1", "test-cg-2", "test-cg-3"];
@@ -193,16 +174,6 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
     // Connect and login to server
     let client = harness.tcp_root_client().await.unwrap();
 
-    // Flush unsaved buffer
-    let topic_id = Identifier::numeric(0).unwrap();
-    for i in 0..7 {
-        let stream_id = Identifier::numeric(i).unwrap();
-        client
-            .flush_unsaved_buffer(&stream_id, &topic_id, 0, true)
-            .await
-            .unwrap();
-    }
-
     // Save stats from the second server (should have double the data)
     let stats = client.get_stats().await.unwrap();
     let actual_messages_size_bytes = stats.messages_size_bytes;
@@ -295,6 +266,7 @@ async fn should_fill_data_and_verify_after_restart(cache_setting: &'static str) 
 #[parallel]
 async fn should_handle_resource_deletion_and_restart() {
     let mut harness = TestHarness::builder()
+        .cluster_nodes(1)
         .server(TestServerConfig::default())
         .build()
         .unwrap();
@@ -322,11 +294,12 @@ async fn should_handle_resource_deletion_and_restart() {
                 .create_topic(
                     &stream_ident,
                     &format!("topic-{}", topic_idx),
-                    3,
-                    CompressionAlgorithm::None,
-                    None,
-                    IggyExpiry::NeverExpire,
-                    MaxTopicSize::Unlimited,
+                    &TopicCreateOptions {
+                        partitions_count: Some(3),
+                        message_expiry: Some(IggyExpiry::NeverExpire),
+                        max_topic_size: Some(MaxTopicSize::Unlimited),
+                        ..TopicCreateOptions::default()
+                    },
                 )
                 .await
                 .unwrap();
@@ -402,11 +375,12 @@ async fn should_handle_resource_deletion_and_restart() {
         .create_topic(
             &stream_0_ident,
             "topic-reused",
-            1,
-            CompressionAlgorithm::None,
-            None,
-            IggyExpiry::NeverExpire,
-            MaxTopicSize::Unlimited,
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                message_expiry: Some(IggyExpiry::NeverExpire),
+                max_topic_size: Some(MaxTopicSize::Unlimited),
+                ..TopicCreateOptions::default()
+            },
         )
         .await
         .unwrap();

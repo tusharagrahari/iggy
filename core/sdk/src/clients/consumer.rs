@@ -39,7 +39,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time;
 use tokio::time::sleep;
-use tracing::{error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 const ORDERING: std::sync::atomic::Ordering = std::sync::atomic::Ordering::SeqCst;
 type PollMessagesFuture = Pin<Box<dyn Future<Output = Result<PolledMessages, IggyError>> + Send>>;
@@ -280,7 +280,12 @@ impl IggyConsumer {
     }
 
     /// Deletes the consumer offset on the server either for the current partition or the provided partition ID.
-    pub async fn delete_offset(&self, partition_id: Option<u32>) -> Result<(), IggyError> {
+    pub async fn delete_offset(&self, mut partition_id: Option<u32>) -> Result<(), IggyError> {
+        // `None` is only resolved server-side for consumer groups. For a standalone consumer
+        // explicitly assign the current partition_id.
+        if partition_id.is_none() && !self.is_consumer_group {
+            partition_id = Some(self.current_partition_id.load(ORDERING));
+        }
         let client = self.client.read().await;
         client
             .delete_consumer_offset(
@@ -1209,7 +1214,10 @@ impl IggyConsumer {
                 .leave_consumer_group(&self.stream_id, &self.topic_id, &group_id)
                 .await
             {
-                warn!(
+                // Expected on clean teardown after an explicit leave (member
+                // not found) or when the group was deleted underneath the
+                // consumer, so this is debug, not a warning.
+                debug!(
                     "Failed to leave consumer group: {group_id} for stream: {}, topic: {}. {error}",
                     self.stream_id, self.topic_id
                 );

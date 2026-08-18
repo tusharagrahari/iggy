@@ -18,25 +18,29 @@
 use crate::oneshot::{self, Receiver, Sender};
 use crate::vsr_timeout::{TimeoutKind, TimeoutManager};
 use crate::{
-    AckLogEvent, Consensus, ControlActionLogEvent, DvcQuorumArray, IgnoreReason, Pipeline,
-    PlaneKind, PrepareLogEvent, Project, ReplicaLogContext, SimEventKind, StoredDvc,
-    ViewChangeLogEvent, ViewChangeReason, dvc_count, dvc_max_commit, dvc_quorum_array_empty,
-    dvc_record, dvc_reset, dvc_select_winner, emit_replica_event, emit_sim_event,
+    AckLogEvent, Consensus, ControlActionLogEvent, DvcQuorumArray, DvcSuffix, IgnoreReason,
+    MergeOutcome, MergeQuorums, MergedLog, Pipeline, PlaneKind, PrepareLogEvent, Project,
+    ReplicaLogContext, SimEventKind, StoredDvc, ViewChangeLogEvent, ViewChangeReason, VsrState,
+    dvc_count, dvc_iter, dvc_quorum_array_empty, dvc_record, dvc_reset, dvc_suffix_decode,
+    emit_replica_event, emit_sim_event, merge_dvc_quorum, seal_prepare_checksum,
 };
 use bit_set::BitSet;
 use clock::{Clock, IggySystemClock};
 use iggy_binary_protocol::{
-    Command2, ConsensusHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
-    ReplyHeader, RequestHeader, RequestStartViewHeader, StartViewChangeHeader, StartViewHeader,
+    Command, ConsensusHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, PrepareOkHeader,
+    ReplyHeader, RequestStartViewHeader, RoutedRequestHeader, StartViewChangeHeader,
+    StartViewHeader, frame_body,
 };
 use iggy_common::IggyTimestamp;
+use iggy_common::calculate_checksum;
 use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
 use server_common::Message;
-use server_common::sharding::{IggyNamespace, METADATA_CONSENSUS_NAMESPACE};
+use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::time::Duration;
 
 /// Injected time source for primary-stamped prepare timestamps.
 ///
@@ -82,7 +86,6 @@ pub trait Sequencer {
     fn current_sequence(&self) -> Self::Sequence;
 
     /// Allocate the next sequence number.
-    /// TODO Should this return a Future<Output = u64>? for async case?
     fn next_sequence(&self) -> Self::Sequence;
 
     /// Update the current sequence number.
@@ -122,16 +125,18 @@ impl Sequencer for LocalSequencer {
     }
 }
 
-/// TODO The below numbers need to be added a consensus config
-/// TODO understand how to configure these numbers.
-/// Maximum number of prepares that can be in-flight in the pipeline.
+/// Default in-flight prepare-queue depth.
 ///
-/// Sized to absorb a synchronized client burst (e.g. the 20-way
-/// concurrent-creation race tests across TCP/QUIC/WebSocket) without
-/// `PipelineFull`-rejecting and disconnecting clients that cannot replay in
-/// time. At depth 8 the QUIC burst wedges the metadata consensus even in
-/// release. Stays well under the journal's `SLOT_COUNT` (1024) and the inbox
-/// capacity headroom.
+/// [`LocalPipeline::new`] uses it, and the server config default
+/// (`DEFAULT_METADATA_PREPARE_QUEUE_DEPTH`) is static-asserted equal to it at
+/// bootstrap. Operators raise the running bound via `[metadata]
+/// prepare_queue_depth`; the pipeline then carries its own capacity (see
+/// [`LocalPipeline::with_capacities`]).
+///
+/// Sized to absorb a synchronized client burst (the 20-way concurrent-creation
+/// race tests across TCP/QUIC/WebSocket) without `PipelineFull`-rejecting
+/// clients that cannot replay in time; a depth of 8 wedged the QUIC burst even
+/// in release. Stays well under the journal's slot count and the inbox headroom.
 pub const PIPELINE_PREPARE_QUEUE_MAX: usize = 32;
 
 /// Max accepted-but-not-yet-prepared requests buffered behind a full
@@ -140,6 +145,27 @@ pub const PIPELINE_REQUEST_QUEUE_MAX: usize = 64;
 
 /// Maximum number of replicas in a cluster.
 pub const REPLICAS_MAX: usize = 32;
+
+/// Ceiling on [`VsrConsensus::quorum_replication`].
+///
+/// Past three acks marginal durability is small and every extra ack sits on the
+/// commit path, so wide clusters spend the difference on the view-change quorum.
+pub const QUORUM_REPLICATION_MAX: usize = 3;
+
+/// Headers a `DoViewChange` may carry, and so the widest uncommitted suffix a
+/// view change can reason about.
+///
+/// Pinned by the wire: `DoViewChangeHeader`'s nack and present bitsets are one
+/// `u128` each, one bit per entry. The suffix spans `commit_max..=op`, bounded by
+/// `prepare_queue_max`, so capping that depth here keeps every suffix addressable.
+pub const DVC_HEADERS_MAX: usize = 128;
+
+/// Deepest prepare queue any node in the cluster may be configured with.
+///
+/// One less than [`DVC_HEADERS_MAX`]: the suffix spans `commit..=op` and the head
+/// needs the reserved slot. Config ceilings and [`LocalPipeline::with_capacities`]
+/// both enforce it, so it holds for a peer as well as for this node.
+pub const PREPARE_QUEUE_CEILING: usize = DVC_HEADERS_MAX - 1;
 
 /// Unanswered `RequestStartView` probes tolerated before a recovering
 /// replica gives up waiting for a settled primary and falls back to an
@@ -237,11 +263,21 @@ impl PipelineEntry {
 /// Accepted request waiting in `request_queue` for a prepare slot.
 #[derive(Debug)]
 pub struct RequestEntry {
-    pub message: Message<RequestHeader>,
-    // TODO: populate from monotonic clock at push, promote to `pub` for
-    // age-based filtering. Currently `0`; `pub(crate)` blocks sort-on-stub.
-    #[allow(dead_code)]
-    pub(crate) received_at: i64,
+    pub message: Message<RoutedRequestHeader>,
+    /// When the request was parked, in microseconds from the consensus-injected
+    /// clock ([`VsrConsensus::clock_realtime_micros`]). `0` until
+    /// [`VsrConsensus::push_queued_request`] stamps it, which is the only path
+    /// that parks an entry in production.
+    ///
+    /// Read through [`Self::queue_wait_micros`] at promotion, never by subtracting
+    /// directly: the queue wait is what age-based shedding filters on and the
+    /// queueing half of end-to-end commit latency.
+    ///
+    /// Deliberately the plain clock read rather than
+    /// [`VsrConsensus::next_monotonic_timestamp`]: this must not consume the
+    /// prepare-stamping monotonic sequence, or parking a request would perturb
+    /// the timestamps replicated to every backup.
+    pub received_at: u64,
     /// In-process reply subscriber, carried through the queue so promotion
     /// can hand it to the pipeline entry (see [`PipelineEntry::with_sender`]).
     /// `None` = network path. Dropping a queued entry (view-change reset,
@@ -251,7 +287,7 @@ pub struct RequestEntry {
 
 impl RequestEntry {
     #[must_use]
-    pub const fn new(message: Message<RequestHeader>) -> Self {
+    pub const fn new(message: Message<RoutedRequestHeader>) -> Self {
         Self {
             message,
             received_at: 0,
@@ -266,7 +302,7 @@ impl RequestEntry {
     /// instead of being bounced with a transient error.
     #[must_use]
     pub fn with_subscriber(
-        message: Message<RequestHeader>,
+        message: Message<RoutedRequestHeader>,
     ) -> (Self, Receiver<Message<ReplyHeader>>) {
         let (sender, receiver) = oneshot::channel();
         let entry = Self {
@@ -281,6 +317,73 @@ impl RequestEntry {
     pub const fn take_reply_sender(&mut self) -> Option<Sender<Message<ReplyHeader>>> {
         self.reply_sender.take()
     }
+
+    /// How long this request has waited, against a realtime reading taken now
+    /// (`VsrConsensus::clock_realtime_micros`).
+    ///
+    /// Saturating, which is why this exists rather than a documented subtraction:
+    /// the realtime clock can step backwards between park and promotion, and on
+    /// `u64` a plain `now - received_at` wraps to ~1.8e19 micros, an age a shed would
+    /// act on. `0` for an unstamped entry.
+    #[must_use]
+    pub const fn queue_wait_micros(&self, now: u64) -> u64 {
+        now.saturating_sub(self.received_at)
+    }
+}
+
+impl<B, P> VsrConsensus<B, P>
+where
+    B: MessageBus,
+    P: Pipeline<Entry = PipelineEntry, Request = RequestEntry>,
+{
+    /// Park a request that could not take a prepare slot, stamping its arrival
+    /// time so the promotion side can measure how long it waited.
+    ///
+    /// # Errors
+    /// The entry itself, when the request queue is at its depth bound.
+    pub fn push_queued_request(&self, mut entry: RequestEntry) -> Result<(), RequestEntry> {
+        entry.received_at = self.clock_realtime_micros();
+        self.pipeline.borrow_mut().push_request(entry)
+    }
+}
+
+/// Outcome of [`VsrConsensus::rollback_pipelined_prepare`].
+///
+/// Only [`Self::Unwound`] mutates. Every refusal leaves the sequencer, parent
+/// chain, and pipeline as it found them, so a caller can report one without
+/// repairing anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareRollback {
+    /// Sequencer, parent chain, and pipeline entry all restored. The op is free
+    /// again and the next request reuses it.
+    Unwound,
+    /// Not primary now, so no pre-advance of this replica's own survives to undo.
+    /// Either a backup that never pre-advanced (it advances only AFTER its append
+    /// succeeds), or a demoted ex-primary whose claim the view-change reset already
+    /// discarded.
+    NotPreAdvanced,
+    /// Refused: a view change ran while the append was parked, so the state this
+    /// prepare pre-advanced is no longer its own. `view` is the current view.
+    ///
+    /// Still primary, and after a re-election the sequencer can sit at `header.op`
+    /// again with a DIFFERENT prepare under it: `start_pending_view` rewinds to the
+    /// merged head and the next request re-projects that number. Unwinding would pop
+    /// a live entry, rewind beneath an op peers have journaled, and mint the op a
+    /// third time. Hence the check ahead of the sequencer compare.
+    Superseded { view: u32 },
+    /// Refused: `sequence` no longer matches the failed op. Two directions, only
+    /// the first with a sibling behind it, neither closable locally:
+    ///
+    /// - `> header.op`: a sibling is live and already chained to a prepare the WAL
+    ///   will never hold, so unwinding would additionally hand out its op number.
+    /// - `< header.op`: a state transfer or view change rewound beneath this op;
+    ///   the pre-advance is simply gone.
+    Overtaken { sequence: u64 },
+    /// Refused: the sequencer matches the failed op but the pipeline tail is a
+    /// different prepare. The two move together everywhere else, so an invariant has
+    /// already broken; release refuses rather than rewinding on numbers it just
+    /// proved it cannot trust.
+    TailMismatch,
 }
 
 /// Two-queue pipeline: in-flight prepares + buffered requests.
@@ -291,7 +394,7 @@ pub struct LocalPipeline {
     /// Requests awaiting a prepare slot; cap [`Self::request_queue_max`].
     request_queue: VecDeque<RequestEntry>,
     /// Depth bound for `prepare_queue`; [`PIPELINE_PREPARE_QUEUE_MAX`]
-    /// unless the operator overrode it (`[metadata]` in the server-ng
+    /// unless the operator overrode it (`[metadata]` in the server
     /// config).
     prepare_queue_max: usize,
     /// Depth bound for `request_queue`; [`PIPELINE_REQUEST_QUEUE_MAX`]
@@ -320,13 +423,24 @@ impl LocalPipeline {
     /// `SnapshotCoordinator` in `core/metadata`).
     ///
     /// # Panics
-    /// If a depth is zero — a zero-depth pipeline can never admit an op.
+    /// If a depth is zero, or if the prepare depth would let the uncommitted
+    /// suffix outgrow what a `DoViewChange` can address.
     #[must_use]
     pub fn with_capacities(prepare_queue_max: usize, request_queue_max: usize) -> Self {
         assert!(
             prepare_queue_max > 0 && request_queue_max > 0,
             "pipeline queue depths must be non-zero \
              (prepare={prepare_queue_max}, request={request_queue_max})"
+        );
+        // Each `DoViewChange` bitset addresses one suffix entry with one bit of a
+        // `u128`, and the suffix spans `commit..=op`. Deeper, and the builder clamps
+        // its window from below, leaving undecidable ops and a stalled view change.
+        // Config ceilings also enforce this; a stall is worth a loud boot.
+        assert!(
+            prepare_queue_max < DVC_HEADERS_MAX,
+            "prepare queue depth {prepare_queue_max} would produce an uncommitted suffix wider \
+             than a DoViewChange can address (max {})",
+            DVC_HEADERS_MAX - 1,
         );
         Self {
             prepare_queue: VecDeque::with_capacity(prepare_queue_max),
@@ -446,8 +560,25 @@ impl LocalPipeline {
         self.prepare_queue.back()
     }
 
+    /// Drop the newest prepare when it is `op`, returning it.
+    ///
+    /// `None` (and no mutation) when the tail is a different op. The queue holds
+    /// a consecutive run, so removing anything but the tail would punch a hole in
+    /// it and break every `message_by_op` index computation; a caller whose op is
+    /// no longer the tail has been overtaken and must not unwind.
+    ///
+    /// The one caller is the journal-append rollback
+    /// ([`VsrConsensus::rollback_pipelined_prepare`]).
+    pub fn remove_prepare_tail(&mut self, op: u64, checksum: u128) -> Option<PipelineEntry> {
+        let tail = self.prepare_queue.back()?;
+        if tail.header.op != op || tail.header.checksum != checksum {
+            return None;
+        }
+        self.prepare_queue.pop_back()
+    }
+
     /// Find a message by op number and checksum (immutable).
-    // Pipeline bounded at PIPELINE_PREPARE_QUEUE_MAX (8) entries; index always fits in usize.
+    // op - head_op is bounded by the configured prepare-queue depth; index always fits in usize.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn message_by_op_and_checksum(&self, op: u64, checksum: u128) -> Option<&PipelineEntry> {
@@ -478,7 +609,7 @@ impl LocalPipeline {
     }
 
     /// Find a message by op number only.
-    // Pipeline bounded at PIPELINE_PREPARE_QUEUE_MAX (8) entries; index always fits in usize.
+    // op - head_op is bounded by the configured prepare-queue depth; index always fits in usize.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn message_by_op(&self, op: u64) -> Option<&PipelineEntry> {
@@ -494,7 +625,7 @@ impl LocalPipeline {
 
     /// Get mutable reference to a message entry by op number.
     /// Returns None if op is not in the pipeline.
-    // Pipeline bounded at PIPELINE_PREPARE_QUEUE_MAX (8) entries; index always fits in usize.
+    // op - head_op is bounded by the configured prepare-queue depth; index always fits in usize.
     #[allow(clippy::cast_possible_truncation)]
     pub fn message_by_op_mut(&mut self, op: u64) -> Option<&mut PipelineEntry> {
         let head_op = self.prepare_queue.front()?.header.op;
@@ -531,8 +662,8 @@ impl LocalPipeline {
     /// If any invariant is violated.
     pub fn verify(&self) {
         // Check capacity limits
-        assert!(self.prepare_queue.len() <= PIPELINE_PREPARE_QUEUE_MAX);
-        assert!(self.request_queue.len() <= PIPELINE_REQUEST_QUEUE_MAX);
+        assert!(self.prepare_queue.len() <= self.prepare_queue_max);
+        assert!(self.request_queue.len() <= self.request_queue_max);
 
         // Verify prepare queue hash chain
         if let Some(head) = self.prepare_queue.front() {
@@ -590,6 +721,10 @@ impl Pipeline for LocalPipeline {
         Self::pop_message(self)
     }
 
+    fn remove_tail(&mut self, op: u64, checksum: u128) -> Option<Self::Entry> {
+        Self::remove_prepare_tail(self, op, checksum)
+    }
+
     fn clear(&mut self) {
         Self::clear(self);
     }
@@ -622,6 +757,10 @@ impl Pipeline for LocalPipeline {
         self.prepare_count()
     }
 
+    fn prepare_queue_max(&self) -> usize {
+        self.prepare_queue_max
+    }
+
     fn verify(&self) {
         Self::verify(self);
     }
@@ -645,6 +784,10 @@ impl Pipeline for LocalPipeline {
     fn pop_request(&mut self) -> Option<Self::Request> {
         Self::pop_request(self)
     }
+
+    fn request_queue_len(&self) -> usize {
+        Self::request_queue_len(self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -652,6 +795,47 @@ pub enum Status {
     Normal,
     ViewChange,
     Recovering,
+}
+
+/// State-transfer progress, orthogonal to [`Status`].
+///
+/// A transferring replica stays a normal protocol participant (it adopts
+/// views, votes, answers probes) but withholds `PrepareOk` and ignores live
+/// prepares (`replicate_preflight` / `send_prepare_ok` gate on
+/// [`Consensus::is_transferring`]) -- it must not vouch for state it is
+/// about to replace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateTransferStage {
+    /// No transfer in progress.
+    Idle,
+    /// Restarted into a cluster: waiting for the view probe to find a live
+    /// primary to fetch from. The probe-exhausted election fallback proves
+    /// full-cluster bootstrap instead and abandons the transfer (local
+    /// recovery is then authoritative).
+    AwaitingTarget,
+    /// Target descriptor accepted; pulling artifact chunks.
+    Fetching,
+    /// Artifacts verified; installing.
+    Installing,
+}
+
+impl StateTransferStage {
+    /// Legal stage transitions; [`VsrConsensus::set_state_transfer_stage`]
+    /// asserts against this so a mis-sequenced handler fails loudly instead
+    /// of corrupting the install.
+    #[must_use]
+    pub const fn valid_transition(from: Self, to: Self) -> bool {
+        matches!(
+            (from, to),
+            (Self::Idle, Self::AwaitingTarget)
+                | (Self::AwaitingTarget, Self::Fetching | Self::Idle)
+                | (
+                    Self::Fetching,
+                    Self::Installing | Self::AwaitingTarget | Self::Idle
+                )
+                | (Self::Installing, Self::Idle)
+        )
+    }
 }
 
 /// What a received `Commit` heartbeat did, so the caller knows whether to
@@ -673,7 +857,7 @@ pub enum CommitOutcome {
 #[derive(Debug, Clone)]
 pub enum VsrAction {
     /// Send `StartViewChange` to all replicas.
-    SendStartViewChange { view: u32, namespace: u64 },
+    SendStartViewChange { view: u32, group: u64 },
     /// Send `DoViewChange` to primary.
     SendDoViewChange {
         view: u32,
@@ -681,19 +865,42 @@ pub enum VsrAction {
         log_view: u32,
         op: u64,
         commit: u64,
-        namespace: u64,
+        group: u64,
+        /// The sender's uncommitted suffix, snapshotted for this view. Carried on
+        /// the action rather than re-read by the dispatcher so the wire bytes match
+        /// this replica's own `StoredDvc`: a merge seeing two versions of one
+        /// sender's suffix could adopt a header no replica holds.
+        suffix: DvcSuffix,
     },
     /// Broadcast a `RequestStartView` probe (recovering replica asking for
     /// the current view's `StartView`; only that view's primary answers).
     /// Stamped with the prober's view so peers can fence stale duplicates
     /// out of the probed-primary election path.
-    SendRequestStartView { view: u32, namespace: u64 },
-    /// Send `StartView` to all backups (as new primary).
+    SendRequestStartView { view: u32, group: u64 },
+    /// Send `StartView`, as the view's primary.
+    ///
+    /// `incarnation` echoes the requester's nonce when this answers a
+    /// `RequestStartView` probe (freshness proof), and is `0` on an unsolicited
+    /// send at view-change completion (carries no freshness claim).
+    ///
+    /// `target` is the probing replica for an echo and `None` for an unsolicited
+    /// broadcast. An echo must not be broadcast: the nonce it carries is one
+    /// replica's freshness proof, and every other peer that is itself recovering
+    /// reads a foreign nonce and rejects an otherwise current `StartView`.
     SendStartView {
         view: u32,
         op: u64,
         commit: u64,
-        namespace: u64,
+        incarnation: u128,
+        target: Option<u8>,
+        group: u64,
+        /// The view's suffix, high-to-low op from `op` down toward `commit`.
+        ///
+        /// Lets a backup check the head it is told to adopt against real headers,
+        /// and gives it canonical checksums to verify repaired bodies against.
+        /// Empty on the probe-answer path, where the primary reports its own
+        /// frontier rather than concluding a view change; the backup trusts `op`.
+        suffix: Vec<PrepareHeader>,
     },
     /// Send `PrepareOK` for each op in `[from_op, to_op]` that is present in the WAL.
     ///
@@ -705,7 +912,7 @@ pub enum VsrAction {
         from_op: u64,
         to_op: u64,
         target: u8,
-        namespace: u64,
+        group: u64,
     },
     /// Retransmit uncommitted prepares from the WAL to replicas that haven't acked.
     ///
@@ -732,7 +939,7 @@ pub enum VsrAction {
     SendCommit {
         view: u32,
         commit: u64,
-        namespace: u64,
+        group: u64,
         timestamp_monotonic: u64,
     },
 }
@@ -768,7 +975,7 @@ where
     cluster: u128,
     replica: u8,
     replica_count: u8,
-    namespace: u64,
+    group: u64,
 
     view: Cell<u32>,
 
@@ -781,9 +988,28 @@ where
     // * `replica.log_view ≥ replica.log_view_durable`
     // * `replica.log_view = 0` when replica_count=1.
     log_view: Cell<u32>,
+    /// The `view` last made durable in the superblock. `view_durable <= view`; a
+    /// view-scoped message must not leave until they are equal, or a crash could
+    /// recover an older view than one this replica already acted in (split brain).
+    /// Advanced by [`Self::mark_superblock_durable`].
+    view_durable: Cell<u32>,
+    /// The `log_view` last made durable in the superblock. Realizes the
+    /// long-standing invariant `log_view >= log_view_durable`.
+    log_view_durable: Cell<u32>,
+    /// Per-boot incarnation nonce, stamped on outbound `RequestStartView` probes
+    /// and echoed in the answering `StartView`, so a recovering replica ignores a
+    /// `StartView` from a previous incarnation still in flight (see the
+    /// [`Self::handle_start_view`] recovering-status guard). `0` means unset
+    /// (partition plane, tests), leaving the guard inert. Set by
+    /// [`Self::set_incarnation`] at boot, before `init`.
+    incarnation: Cell<u128>,
     /// Commit point the recovered WAL suffix must re-reach before admitting
     /// client requests as primary (`0` = no recovered suffix pending).
     recovery_barrier: Cell<u64>,
+    /// Wall-clock budget the recovered suffix has to re-commit before a waiter
+    /// on [`Self::recovery_barrier`] gives up. Armed together with the barrier;
+    /// `ZERO` when no suffix is pending (barrier `0`), which no waiter reads.
+    recovery_deadline: Cell<Duration>,
     /// True while this replica declines the primaryship its (stale) recovered
     /// view assigns it (see `init_as_backup`). `is_primary()` is pure view
     /// math, so without this flag a restarted view-N primary would still pass
@@ -792,6 +1018,21 @@ where
     /// legitimately (`StartView` adoption, DVC completion).
     ceded_primaryship: Cell<bool>,
     status: Cell<Status>,
+    /// See [`StateTransferStage`]. Set to `AwaitingTarget` by a cluster
+    /// restart boot (`begin_state_transfer_await`), driven through
+    /// `Fetching`/`Installing` by the shard's transfer session, cleared by
+    /// the probe-exhausted election fallback (full-cluster bootstrap).
+    state_transfer_stage: Cell<StateTransferStage>,
+
+    /// Highest view seen on inbound traffic that this replica could not
+    /// process because the view was ahead of its own (a dropped newer-view
+    /// prepare or heartbeat). Proof the cluster elected past this replica
+    /// rather than that the primary died, which is why the heartbeat-timeout
+    /// handler probes to catch up instead of starting a futile election (see
+    /// [`Self::handle_normal_heartbeat_timeout`]). Monotone `max`; a value at
+    /// or below `view` is stale and inert because the catch-up guard is a
+    /// strict `>`.
+    observed_newer_view: Cell<u32>,
 
     /// Highest op number that has been locally executed (state machine applied,
     /// client table updated). Advances one-by-one in `commit_journal` (backup)
@@ -809,14 +1050,47 @@ where
     last_prepare_checksum: Cell<u128>,
 
     pipeline: RefCell<P>,
+    /// Snapshot of the pipeline's in-flight prepare capacity, taken at
+    /// construction. Bounds the loopback queue and the view-change rebuild
+    /// range without re-borrowing `pipeline`.
+    prepare_queue_max: usize,
 
     message_bus: B,
     loopback_queue: RefCell<VecDeque<Message<GenericHeader>>>,
     /// Tracks start view change messages received from all replicas (including self)
     start_view_change_from_all_replicas: RefCell<BitSet<u32>>,
     /// Consecutive unanswered `RequestStartView` probes while Recovering;
-    /// at [`PROBE_ATTEMPTS_MAX`] the replica falls back to an election.
+    /// at the `probe_attempts_max` ceiling the replica falls back to an
+    /// election.
     probe_attempts: Cell<u32>,
+    /// Probe-attempt ceiling backing the fall-back-to-election decision,
+    /// seeded from [`PROBE_ATTEMPTS_MAX`] and overridable by the runtime via
+    /// `[cluster] view_probe_attempts_max`. The simulator and tests keep the
+    /// built-in default.
+    probe_attempts_max: Cell<u32>,
+
+    /// This replica's own uncommitted suffix, with the `(op, commit)` the journal
+    /// was at when it was read.
+    ///
+    /// Installed by the shard via [`Self::set_local_dvc_suffix`] before any handler
+    /// that could enter a view change. Snapshotted rather than recomputed per send
+    /// so a retransmit is byte-identical: a nack is a durable claim about this
+    /// replica's log, and silently retracting one lets the new primary assemble a
+    /// quorum that never simultaneously existed.
+    ///
+    /// Tagged by `(op, commit)`, not by view, because that is what the suffix
+    /// describes: a view advance leaves the log alone so the snapshot survives,
+    /// while anything moving the head or commit point makes the tag mismatch,
+    /// which reads as no snapshot at all.
+    local_dvc_suffix: RefCell<Option<(u64, u64, DvcSuffix)>>,
+
+    /// The log a DVC quorum settled on, parked until this replica's journal can
+    /// serve all of it.
+    ///
+    /// Non-`None` means "primary-elect, repairing": decided but not started, so
+    /// this replica prepares and announces nothing. Cleared by
+    /// [`VsrConsensus::start_pending_view`], or by `reset_view_change_state`.
+    pending_view_log: RefCell<Option<MergedLog>>,
 
     /// Tracks DVC messages received (only used by primary candidate)
     /// Stores metadata; actual log comes from message
@@ -847,7 +1121,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         cluster: u128,
         replica: u8,
         replica_count: u8,
-        namespace: u64,
+        group: u64,
         message_bus: B,
         pipeline: P,
     ) -> Self {
@@ -855,7 +1129,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             cluster,
             replica,
             replica_count,
-            namespace,
+            group,
             message_bus,
             pipeline,
             ConsensusClock::system(),
@@ -872,7 +1146,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         cluster: u128,
         replica: u8,
         replica_count: u8,
-        namespace: u64,
+        group: u64,
         message_bus: B,
         pipeline: P,
         clock: ConsensusClock,
@@ -883,39 +1157,50 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         );
         assert!(replica_count >= 1, "need at least 1 replica");
         // Consensus-control routing distinguishes metadata frames from
-        // partition frames by namespace value: metadata uses the sentinel,
+        // partition frames by the group id: metadata uses the sentinel,
         // partitions use `IggyNamespace::inner()` which lives strictly
-        // inside the packed range. A namespace outside both ranges would
+        // inside the packed range. A group outside both ranges would
         // route to neither and silently warn-drop on every receiving peer.
         debug_assert!(
-            namespace == METADATA_CONSENSUS_NAMESPACE || IggyNamespace::is_packable(namespace),
-            "VsrConsensus namespace must be METADATA_CONSENSUS_NAMESPACE or a packable \
-             IggyNamespace; got {namespace:#x}"
+            group == METADATA_GROUP || IggyNamespace::is_packable(group),
+            "VsrConsensus group must be METADATA_GROUP or a packable \
+             IggyNamespace; got {group:#x}"
         );
-        // TODO: Verify that XOR-based seeding provides sufficient jitter diversity
-        // across groups. Consider using a proper hash (e.g., Murmur3) of
-        // (replica_id, namespace) for production.
-        let timeout_seed = u128::from(replica) ^ u128::from(namespace);
+        // Jitter only has to desynchronize replicas of one group, whose ids
+        // differ, so the XOR cannot collide where it matters; `seed_from_u64`
+        // (SplitMix64) decorrelates the streams of nearby seeds.
+        let timeout_seed = u128::from(replica) ^ u128::from(group);
+        let prepare_queue_max = pipeline.prepare_queue_max();
         Self {
             cluster,
             replica,
             replica_count,
-            namespace,
+            group,
             view: Cell::new(0),
             log_view: Cell::new(0),
+            view_durable: Cell::new(0),
+            log_view_durable: Cell::new(0),
+            incarnation: Cell::new(0),
             recovery_barrier: Cell::new(0),
+            recovery_deadline: Cell::new(Duration::ZERO),
             ceded_primaryship: Cell::new(false),
             status: Cell::new(Status::Recovering),
+            state_transfer_stage: Cell::new(StateTransferStage::Idle),
+            observed_newer_view: Cell::new(0),
             sequencer: LocalSequencer::new(0),
             commit_min: Cell::new(0),
             commit_max: Cell::new(0),
             last_timestamp: Cell::new(0),
             last_prepare_checksum: Cell::new(0),
             pipeline: RefCell::new(pipeline),
+            prepare_queue_max,
             message_bus,
-            loopback_queue: RefCell::new(VecDeque::with_capacity(PIPELINE_PREPARE_QUEUE_MAX)),
+            loopback_queue: RefCell::new(VecDeque::with_capacity(prepare_queue_max)),
             start_view_change_from_all_replicas: RefCell::new(BitSet::with_capacity(REPLICAS_MAX)),
             probe_attempts: Cell::new(0),
+            probe_attempts_max: Cell::new(PROBE_ATTEMPTS_MAX),
+            local_dvc_suffix: RefCell::new(None),
+            pending_view_log: RefCell::new(None),
             do_view_change_from_all_replicas: RefCell::new(dvc_quorum_array_empty()),
             do_view_change_quorum: Cell::new(false),
             sent_own_start_view_change: Cell::new(false),
@@ -934,11 +1219,71 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.timeouts.borrow_mut().set_normal_heartbeat_ticks(ticks);
     }
 
+    /// Override the primary's commit-broadcast interval, in consensus ticks.
+    /// Sized from `[cluster] commit_broadcast_interval` by the runtime. Must
+    /// run before `init` / `init_as_backup`: the override discards any
+    /// countdown already in flight.
+    pub fn set_commit_message_ticks(&self, ticks: u64) {
+        self.timeouts.borrow_mut().set_commit_message_ticks(ticks);
+    }
+
+    /// Override the primary's prepare-retransmit interval, in consensus ticks.
+    /// Sized from `[cluster] prepare_retransmit_interval` by the runtime. Must
+    /// run before `init` / `init_as_backup`: the override discards any
+    /// countdown already in flight.
+    pub fn set_prepare_ticks(&self, ticks: u64) {
+        self.timeouts.borrow_mut().set_prepare_ticks(ticks);
+    }
+
+    /// Override the view-change retransmit interval (`StartViewChange` and
+    /// `DoViewChange`, kept equal), in consensus ticks. Sized from `[cluster]
+    /// view_change_retransmit_interval` by the runtime. Must run before `init`
+    /// / `init_as_backup`: the override discards any countdown already in
+    /// flight.
+    pub fn set_view_change_retransmit_ticks(&self, ticks: u64) {
+        self.timeouts
+            .borrow_mut()
+            .set_view_change_retransmit_ticks(ticks);
+    }
+
+    /// Override the view-change status backstop, in consensus ticks. Sized from
+    /// `[cluster] view_change_status_timeout` by the runtime. Must run before
+    /// `init` / `init_as_backup`: the override discards any countdown already
+    /// in flight.
+    pub fn set_view_change_status_ticks(&self, ticks: u64) {
+        self.timeouts
+            .borrow_mut()
+            .set_view_change_status_ticks(ticks);
+    }
+
+    /// Override the request-start-view retransmit interval, in consensus ticks.
+    /// Sized from `[cluster] request_start_view_retransmit_interval` by the
+    /// runtime. Must run before `init` / `init_as_backup`: the override
+    /// discards any countdown already in flight.
+    pub fn set_request_start_view_ticks(&self, ticks: u64) {
+        self.timeouts
+            .borrow_mut()
+            .set_request_start_view_ticks(ticks);
+    }
+
+    /// Override the recovering-replica probe-attempt ceiling before it falls
+    /// back to an election. Sized from `[cluster] view_probe_attempts_max` by
+    /// the runtime; the simulator and tests keep [`PROBE_ATTEMPTS_MAX`]. Must
+    /// run before `init` / `init_as_backup`.
+    pub fn set_probe_attempts_max(&self, max: u32) {
+        self.probe_attempts_max.set(max);
+    }
+
     pub fn init(&self) {
         self.status.set(Status::Normal);
         let mut timeouts = self.timeouts.borrow_mut();
         if self.is_primary() {
-            timeouts.start(TimeoutKind::Prepare);
+            // Prepare is deliberately NOT armed here: a fresh primary has an
+            // empty pipeline and nothing to retransmit, and the timer is owned by
+            // the pipeline's edges from this point on ("ticking iff the pipeline
+            // is non-empty", see `sync_prepare_timeout`). The first
+            // `push_prepare_entry` arms it, timed from that push rather than from
+            // boot.
             timeouts.start(TimeoutKind::CommitMessage);
         } else {
             timeouts.start(TimeoutKind::NormalHeartbeat);
@@ -951,9 +1296,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// primary for different planes and clients route to the wrong one. Join
     /// as a backup instead; either the peers' heartbeat timeout elects a
     /// primary and its `StartView` brings this replica forward, or this
-    /// replica's own silence provokes that election. Unlike
-    /// [`Self::init_recovering`] the local journal is intact, so the normal
-    /// commit walk applies it -- no commit-floor fast-forward.
+    /// replica's own silence provokes that election.
+    ///
+    /// The local journal is intact here, so the normal commit walk applies it and no
+    /// commit-floor fast-forward is needed. Callers pair this with
+    /// [`Self::begin_view_probe`], which moves the replica to `Status::Recovering` so
+    /// it stays quorum-invisible until a `StartView` answers.
     pub fn init_as_backup(&self) {
         self.status.set(Status::Normal);
         self.ceded_primaryship.set(true);
@@ -966,6 +1314,20 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     #[must_use]
     pub const fn has_ceded_primaryship(&self) -> bool {
         self.ceded_primaryship.get()
+    }
+
+    /// Set the per-boot incarnation nonce, at boot before `init`. Production
+    /// supplies a random `u128`; the deterministic simulator supplies a
+    /// seed-derived value bumped per restart. See the `incarnation` field.
+    pub fn set_incarnation(&self, incarnation: u128) {
+        self.incarnation.set(incarnation);
+    }
+
+    /// This replica's per-boot incarnation nonce (`0` when unset). Stamped on
+    /// outbound `RequestStartView` probes by the shard.
+    #[must_use]
+    pub const fn incarnation(&self) -> u128 {
+        self.incarnation.get()
     }
 
     #[must_use]
@@ -1063,10 +1425,45 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         (self.replica_count as usize - 1) / 2
     }
 
-    /// Quorum size = f + 1 = `max_faulty` + 1
+    /// Replicas that must ack before an op is committed.
+    ///
+    /// Capped at [`QUORUM_REPLICATION_MAX`] to keep a wide cluster's commit path
+    /// cheap; the view-change quorum grows so the two still sum above the count.
     #[must_use]
-    pub const fn quorum(&self) -> usize {
-        self.max_faulty() + 1
+    pub const fn quorum_replication(&self) -> usize {
+        if self.replica_count == 2 {
+            // =1 would intersect, but =2 keeps a two-replica cluster durable.
+            return 2;
+        }
+        let half_rounded_up = (self.replica_count as usize).div_ceil(2);
+        if half_rounded_up < QUORUM_REPLICATION_MAX {
+            half_rounded_up
+        } else {
+            QUORUM_REPLICATION_MAX
+        }
+    }
+
+    /// Replicas that must send a `DoViewChange` before a view can start.
+    ///
+    /// Pays for the cheaper replication quorum, which is the far hotter path.
+    #[must_use]
+    pub const fn quorum_view_change(&self) -> usize {
+        if self.replica_count == 2 {
+            // Avoids a single-replica view change special case.
+            return 2;
+        }
+        self.replica_count as usize - self.quorum_replication() + 1
+    }
+
+    /// Nacks required to prove an op was never committed, so the new primary may
+    /// truncate it.
+    ///
+    /// Sized so a nack quorum and a replication quorum cannot both exist for one
+    /// op. This is what makes truncation safe, so it is the one quorum that must
+    /// never be loosened.
+    #[must_use]
+    pub const fn quorum_nack_prepare(&self) -> usize {
+        self.replica_count as usize - self.quorum_replication() + 1
     }
 
     /// Highest op locally executed (state machine applied, client table updated).
@@ -1107,6 +1504,17 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.recovery_barrier.set(required_commit);
     }
 
+    /// Deadline paired with [`Self::recovery_barrier`]; only meaningful while the
+    /// barrier is armed (non-zero).
+    #[must_use]
+    pub const fn recovery_deadline(&self) -> Duration {
+        self.recovery_deadline.get()
+    }
+
+    pub fn set_recovery_deadline(&self, deadline: Duration) {
+        self.recovery_deadline.set(deadline);
+    }
+
     pub fn set_view(&mut self, view: u32) {
         self.view.set(view);
     }
@@ -1116,17 +1524,121 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.status.get()
     }
 
-    // TODO(hubcio): returning &RefCell<P> leaks interior mutability - callers
-    // could hold a Ref/RefMut across an .await and cause a runtime panic.
-    // We had this problem with slab + ECS.
+    /// Run `f` against the pipeline.
+    ///
+    /// The borrow cannot escape `f`, so it cannot be held across an `.await` and
+    /// alias a sibling task's `borrow_mut` into a `BorrowMutError` panic. Same
+    /// shape, and the same reason, as `IggyPartitions::with_partition`. Prefer
+    /// the named accessors below; this is for the few callers that need several
+    /// reads under one borrow.
+    pub fn with_pipeline<R>(&self, f: impl FnOnce(&P) -> R) -> R {
+        f(&self.pipeline.borrow())
+    }
+
+    /// [`Self::with_pipeline`] for a mutating operation.
+    ///
+    /// Callers that pop or clear should prefer [`Self::pop_committed_prepare`] /
+    /// [`Self::clear_pipeline`], which also keep the prepare timeout's
+    /// ticking-iff-non-empty invariant. This form does not.
+    pub fn with_pipeline_mut<R>(&self, f: impl FnOnce(&mut P) -> R) -> R {
+        f(&mut self.pipeline.borrow_mut())
+    }
+
+    /// Whether the prepare queue is at its depth bound; callers route to
+    /// [`Self::push_queued_request`] on `true`.
     #[must_use]
-    pub const fn pipeline(&self) -> &RefCell<P> {
-        &self.pipeline
+    pub fn pipeline_is_full(&self) -> bool {
+        self.pipeline.borrow().is_full()
     }
 
     #[must_use]
-    pub const fn pipeline_mut(&mut self) -> &mut RefCell<P> {
-        &mut self.pipeline
+    pub fn pipeline_is_empty(&self) -> bool {
+        self.pipeline.borrow().is_empty()
+    }
+
+    /// In-flight prepare count.
+    #[must_use]
+    pub fn pipeline_len(&self) -> usize {
+        self.pipeline.borrow().len()
+    }
+
+    /// Requests parked waiting for a prepare slot.
+    #[must_use]
+    pub fn request_queue_len(&self) -> usize {
+        self.pipeline.borrow().request_queue_len()
+    }
+
+    /// Whether either queue already carries a request from `client_id`: the
+    /// metadata plane's in-flight dedup.
+    #[must_use]
+    pub fn pipeline_has_message_from_client(&self, client_id: u128) -> bool {
+        self.pipeline.borrow().has_message_from_client(client_id)
+    }
+
+    /// Header of the oldest in-flight prepare.
+    #[must_use]
+    pub fn pipeline_head_header(&self) -> Option<PrepareHeader> {
+        self.pipeline.borrow().head().map(|entry| entry.header)
+    }
+
+    /// Whether an in-flight prepare matches `(op, checksum)`: the ack paths' test
+    /// that the frame they are about to count still describes a live entry.
+    #[must_use]
+    pub fn pipeline_holds_entry(&self, op: u64, checksum: u128) -> bool {
+        self.pipeline
+            .borrow()
+            .entry_by_op_and_checksum(op, checksum)
+            .is_some()
+    }
+
+    /// Promote the oldest parked request, if any.
+    pub fn pop_queued_request(&self) -> Option<P::Request> {
+        self.pipeline.borrow_mut().pop_request()
+    }
+
+    /// Pop the pipeline head once its op has committed, keeping the prepare
+    /// timeout's lifecycle in step.
+    ///
+    /// The timeout measures the age of the oldest un-acked prepare, so draining
+    /// the head has to either stop it (nothing left to retransmit) or restart it
+    /// (the next entry becomes the oldest, and it must be timed from now rather
+    /// than inheriting the drained entry's elapsed ticks). Arming happens in
+    /// [`Self::push_prepare_entry`]; between the two the invariant is "ticking
+    /// iff the pipeline is non-empty".
+    pub fn pop_committed_prepare(&self) -> Option<P::Entry> {
+        let popped = self.pipeline.borrow_mut().pop();
+        if popped.is_some() {
+            self.sync_prepare_timeout();
+        }
+        popped
+    }
+
+    /// Drop every in-flight prepare and parked request, and disarm the prepare
+    /// timeout with them (a view change re-prepares from the new primary; there
+    /// is nothing left here to retransmit).
+    pub fn clear_pipeline(&self) {
+        self.pipeline.borrow_mut().clear();
+        self.timeouts.borrow_mut().stop(TimeoutKind::Prepare);
+    }
+
+    /// Re-establish "prepare timeout ticking iff the pipeline is non-empty".
+    ///
+    /// Stops the timer on an empty pipeline; otherwise restarts it so it times
+    /// the current oldest entry from now. Exposed for the plane-side drains that
+    /// pop through [`Pipeline`] directly (`drain_committable_prefix`) rather than
+    /// through [`Self::pop_committed_prepare`].
+    pub fn sync_prepare_timeout(&self) {
+        let empty = self.pipeline.borrow().is_empty();
+        let mut timeouts = self.timeouts.borrow_mut();
+        if empty {
+            timeouts.stop(TimeoutKind::Prepare);
+        } else {
+            // `start`, not `reset`: `reset` leaves `ticking` untouched, so a timer
+            // stopped earlier would come back armed-but-dead and never fire. On an
+            // already-ticking timer the two are the same call. Same trap
+            // `advance_commit_max` documents.
+            timeouts.start(TimeoutKind::Prepare);
+        }
     }
 
     /// Push a pre-built [`PipelineEntry`]; start prepare timeout if idle.
@@ -1182,6 +1694,67 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
     }
 
+    /// Undo the [`Self::push_prepare_entry`] pre-advance for a prepare whose
+    /// journal append failed, so the op it claimed is handed back.
+    ///
+    /// The pre-advance runs the sequencer ahead of the WAL on purpose, so that a
+    /// sibling `on_request` racing the append await cannot project a duplicate op.
+    /// The cost is that a failed append leaves the op claimed with nothing durable
+    /// behind it: the next prepare chains off a phantom, the WAL takes a permanent
+    /// hole at that op, and the divergence rides the handoff bundle out to peers.
+    ///
+    /// Rolls the sequencer back to `header.op - 1` and the parent chain to
+    /// `header.parent`, both of which the header records from the moment it was
+    /// projected, and drops the pipeline entry so the reclaimed op is free rather
+    /// than colliding with a live entry. Dropping the entry drops its reply
+    /// sender, so a waiting client observes `Canceled` instead of hanging until
+    /// the request times out.
+    ///
+    /// The observed prepare timestamp is deliberately NOT rolled back:
+    /// [`Self::next_monotonic_timestamp`] only ever needs a lower bound, and
+    /// lowering it back could re-stamp a value a peer already observed.
+    ///
+    /// Runs after an `.await`, so the state it means to unwind may have been
+    /// reassigned meanwhile. Four guards prove the pre-advance is still this
+    /// prepare's (primaryship, its view, `Normal` status, and a tail matched on
+    /// `(op, checksum)`), and only [`PrepareRollback::Unwound`] mutates.
+    ///
+    /// See [`PrepareRollback`] for the outcomes.
+    pub fn rollback_pipelined_prepare(&self, header: &PrepareHeader) -> PrepareRollback {
+        if !self.is_primary() {
+            return PrepareRollback::NotPreAdvanced;
+        }
+        // Ahead of the sequencer compare: a view change concluding under the append
+        // leaves it able to match `header.op` with a different prepare beneath it.
+        if header.view != self.view.get() || !self.is_normal() {
+            return PrepareRollback::Superseded {
+                view: self.view.get(),
+            };
+        }
+        let sequence = self.sequencer.current_sequence();
+        if sequence != header.op {
+            return PrepareRollback::Overtaken { sequence };
+        }
+        // Matched on `(op, checksum)`: an op number alone is not unique across views,
+        // and a same-numbered entry belonging to someone else is the whole hazard.
+        // A refusal, not a `debug_assert`: the state is reachable from a race rather
+        // than a bug here, and asserting would panic debug builds on exactly what
+        // release declines to act on.
+        let Some(removed) = self
+            .pipeline
+            .borrow_mut()
+            .remove_tail(header.op, header.checksum)
+        else {
+            return PrepareRollback::TailMismatch;
+        };
+        drop(removed);
+        self.sequencer.set_sequence(header.op.saturating_sub(1));
+        self.set_last_prepare_checksum(header.parent);
+        // The pop may have emptied the pipeline; the timeout is owned by its edges.
+        self.sync_prepare_timeout();
+        PrepareRollback::Unwound
+    }
+
     /// Push `message` with in-band reply subscriber.
     ///
     /// Like [`Consensus::pipeline_message`], but entry is built via
@@ -1234,8 +1807,8 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     }
 
     #[must_use]
-    pub const fn namespace(&self) -> u64 {
-        self.namespace
+    pub const fn group(&self) -> u64 {
+        self.group
     }
 
     #[must_use]
@@ -1316,6 +1889,119 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.log_view.set(log_view);
     }
 
+    /// Snapshot the durable VSR state for the superblock. `view`, `log_view`,
+    /// `commit_max`, and the replica identity come from consensus; the caller
+    /// supplies the paired checkpoint, which consensus does not own.
+    #[must_use]
+    pub const fn vsr_state(&self, checkpoint_op: u64, checkpoint_checksum: u128) -> VsrState {
+        VsrState {
+            cluster: self.cluster,
+            replica_id: self.replica,
+            replica_count: self.replica_count,
+            view: self.view.get(),
+            log_view: self.log_view.get(),
+            commit_max: self.commit_max.get(),
+            checkpoint_op,
+            checkpoint_checksum,
+            // Consensus mints no message offsets: the PARTITION plane stamps
+            // this in before it writes (`IggyPartition::write_superblock`).
+            offset_frontier: 0,
+        }
+    }
+
+    /// Install this replica's uncommitted-suffix snapshot for the current view.
+    ///
+    /// Called by the shard, which owns the journal. Consensus keeps the snapshot
+    /// rather than deriving it so the copy in this replica's `StoredDvc` and the
+    /// copy on the wire are the same bytes: a merge seeing two versions of one
+    /// sender's suffix could adopt a header no replica holds.
+    ///
+    /// Installing twice for one view overwrites: the shard refreshes before each
+    /// handler, and a later suffix is at least as complete (repair only adds).
+    pub fn set_local_dvc_suffix(&self, suffix: DvcSuffix) {
+        let (op, commit) = self.local_dvc_suffix_tag();
+        *self.local_dvc_suffix.borrow_mut() = Some((op, commit, suffix));
+    }
+
+    /// Drop the cached suffix snapshot.
+    ///
+    /// The `(op, commit)` tag tracks how far the log reaches, not what it still
+    /// contains, so a mutation that removes entries without moving either
+    /// (truncating a diverging uncommitted range) leaves a snapshot reading as
+    /// current while offering bodies this replica can no longer serve. A peer that
+    /// picks it as a body source then waits out the whole view change.
+    ///
+    /// Call from the mutation site. The next refresh re-reads the journal.
+    pub fn invalidate_local_dvc_suffix(&self) {
+        self.local_dvc_suffix.borrow_mut().take();
+    }
+
+    /// The `(op, commit)` a snapshot must match to still describe this log.
+    /// `commit` is clamped to `op` exactly as the outgoing DVC clamps it.
+    fn local_dvc_suffix_tag(&self) -> (u64, u64) {
+        let op = self.sequencer.current_sequence();
+        (op, self.commit_max.get().min(op))
+    }
+
+    /// This replica's suffix snapshot, or an empty one when none matches the log's
+    /// current head and commit point. Empty is the safe direction: it nacks nothing
+    /// and offers no bodies, so it can only stall a view change, never authorise a
+    /// truncation.
+    #[must_use]
+    pub fn local_dvc_suffix(&self) -> DvcSuffix {
+        let tag = self.local_dvc_suffix_tag();
+        match &*self.local_dvc_suffix.borrow() {
+            Some((op, commit, suffix)) if (*op, *commit) == tag => suffix.clone(),
+            _ => DvcSuffix::empty(),
+        }
+    }
+
+    /// True when no snapshot matches the log's current head and commit point,
+    /// so the shard must read one from the journal before this replica votes.
+    #[must_use]
+    pub fn local_dvc_suffix_stale(&self) -> bool {
+        let tag = self.local_dvc_suffix_tag();
+        !matches!(
+            &*self.local_dvc_suffix.borrow(),
+            Some((op, commit, _)) if (*op, *commit) == tag
+        )
+    }
+
+    /// True when the current `(view, log_view)` is not yet in the superblock, so a
+    /// view-scoped send would advertise a view a crash could lose. The split-brain
+    /// gate: the dispatcher persists first when this holds. `commit_max` is
+    /// excluded deliberately, since it advances on every commit and rides the
+    /// checkpoint write rather than each view change.
+    #[must_use]
+    pub const fn needs_superblock_persist(&self) -> bool {
+        self.view.get() != self.view_durable.get()
+            || self.log_view.get() != self.log_view_durable.get()
+    }
+
+    /// Record that the superblock now durably holds `(view, log_view)`: the exact
+    /// values written, NOT a re-read of the current in-memory view.
+    ///
+    /// The caller passes what it wrote because the in-memory view can advance
+    /// across the write's `.await`, when a concurrent checkpoint holds the
+    /// superblock lock while the pump adopts a newer view via `handle_start_view`.
+    /// Re-reading `self.view` here would mark that newer, unwritten view durable,
+    /// and [`Self::needs_superblock_persist`] would wrongly report it safe to
+    /// send: the split-brain footgun this signature removes.
+    ///
+    /// Called after a successful write with the state written, and on boot with
+    /// the recovered `(view, log_view)`, durable by definition.
+    pub fn mark_superblock_durable(&self, view: u32, log_view: u32) {
+        debug_assert!(
+            view <= self.view.get() && log_view <= self.log_view.get(),
+            "durable (view={view}, log_view={log_view}) cannot exceed in-memory \
+             (view={}, log_view={})",
+            self.view.get(),
+            self.log_view.get(),
+        );
+        self.view_durable.set(view);
+        self.log_view_durable.set(log_view);
+    }
+
     #[must_use]
     pub const fn is_primary_for_view(&self, view: u32) -> bool {
         self.primary_index(view) == self.replica
@@ -1363,13 +2049,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         self.reset_dvc_quorum();
         self.sent_own_start_view_change.set(false);
         self.sent_own_do_view_change.set(false);
+        // A merge parked for the superseded view may describe a different log, so
+        // drop it and let the new attempt re-derive from the DVCs it collects.
+        self.pending_view_log.borrow_mut().take();
         self.loopback_queue.borrow_mut().clear();
         let mut pipeline = self.pipeline.borrow_mut();
         pipeline.cancel_all_subscribers();
         pipeline.clear_request_queue();
     }
 
-    /// Process one tick. Call this periodically (e.g., every 10ms).
+    /// Process one tick. Call this every [`crate::TICK_INTERVAL`].
     ///
     /// Returns a list of actions to take based on fired timeouts.
     /// Empty vec means no actions needed.
@@ -1436,7 +2125,19 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                     // primary answers well before the fallback fires.
                     let attempts = self.probe_attempts.get() + 1;
                     self.probe_attempts.set(attempts);
-                    if attempts >= PROBE_ATTEMPTS_MAX {
+                    if attempts >= self.probe_attempts_max.get() {
+                        // Nobody answered: full-cluster bootstrap, so there
+                        // is no live primary to fetch state from. Local
+                        // recovery is authoritative; abandon the transfer
+                        // and elect on recovered logs.
+                        if self.state_transfer_stage.get() != StateTransferStage::Idle {
+                            tracing::info!(
+                                replica = self.replica,
+                                namespace_raw = self.group,
+                                "view probe exhausted; abandoning state transfer (cluster bootstrap)"
+                            );
+                            self.set_state_transfer_stage(StateTransferStage::Idle);
+                        }
                         self.finish_view_probe();
                         actions.extend(
                             self.start_election(plane, ViewChangeReason::ViewProbeUnanswered),
@@ -1447,7 +2148,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                             .reset(TimeoutKind::RequestStartViewMessage);
                         actions.push(VsrAction::SendRequestStartView {
                             view: self.view.get(),
-                            namespace: self.namespace,
+                            group: self.group,
                         });
                     }
                 }
@@ -1457,7 +2158,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                         .reset(TimeoutKind::RequestStartViewMessage);
                     actions.push(VsrAction::SendRequestStartView {
                         view: self.view.get(),
-                        namespace: self.namespace,
+                        group: self.group,
                     });
                 }
                 _ => {
@@ -1506,13 +2207,60 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
+        // Distinguish "primary died" from "primary moved to a view I missed".
+        // If newer-view traffic has been arriving (a partition that healed
+        // across an election, or a fresh/rejoined node that never saw the
+        // election), the primary is alive and the timer only fired because a
+        // matching-view heartbeat never reset it. Electing would be futile --
+        // a lagging replica cannot win -- and would drag a healthy cluster
+        // through a needless view change. Probe instead: the current primary
+        // answers a `RequestStartView` with its live `StartView` regardless of
+        // the probe's view stamp, and adopting it routes into journal repair
+        // (and state transfer, if the gap fell below the peer's floor). The
+        // probe re-broadcasts on its own timer, so no action is emitted here;
+        // `Recovering` also makes this timeout inert until the probe resolves.
+        if self.observed_newer_view.get() > self.view.get() {
+            tracing::info!(
+                replica = self.replica,
+                namespace_raw = self.group,
+                view = self.view.get(),
+                observed_newer_view = self.observed_newer_view.get(),
+                "heartbeat timed out behind a newer view; probing to catch up"
+            );
+            self.begin_view_probe();
+            return Vec::new();
+        }
+
         self.start_election(plane, ViewChangeReason::NormalHeartbeatTimeout)
     }
 
     /// Advance to `view + 1` and start a view change (own SVC counted).
     fn start_election(&self, plane: PlaneKind, reason: ViewChangeReason) -> Vec<VsrAction> {
+        self.enter_view_change(plane, self.view.get() + 1, reason)
+    }
+
+    /// Enter `Status::ViewChange` at `new_view`: count this replica's own SVC,
+    /// arm the view-change timers, and schedule the SVC broadcast.
+    ///
+    /// The own-SVC bookkeeping is a direct insert rather than an SVC delivered to
+    /// self through the loopback. Deciding to change view is a local state
+    /// transition, not a message this replica happens to address to itself, and
+    /// it has to be atomic with the view/status writes above it: a self-message
+    /// would land on a later pump drain, leaving a window where the replica has
+    /// entered a view change without counting itself. On a solo group that window
+    /// IS the whole quorum. `PrepareOk` loops through the loopback because it
+    /// genuinely is a message to a peer that happens to be this replica.
+    ///
+    /// The three callers that used to inline this sequence were the actual
+    /// duplication: an election timeout, an SVC for a higher view, and a DVC for
+    /// a higher view, differing only in `reason`.
+    fn enter_view_change(
+        &self,
+        plane: PlaneKind,
+        new_view: u32,
+        reason: ViewChangeReason,
+    ) -> Vec<VsrAction> {
         let old_view = self.view.get();
-        let new_view = old_view + 1;
 
         self.view.set(new_view);
         self.status.set(Status::ViewChange);
@@ -1542,7 +2290,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         let action = VsrAction::SendStartViewChange {
             view: new_view,
-            namespace: self.namespace,
+            group: self.group,
         };
         emit_sim_event(
             SimEventKind::ControlMessageScheduled,
@@ -1566,7 +2314,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         let action = VsrAction::SendStartViewChange {
             view: self.view.get(),
-            namespace: self.namespace,
+            group: self.group,
         };
         emit_sim_event(
             SimEventKind::ControlMessageScheduled,
@@ -1597,16 +2345,13 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .borrow_mut()
             .reset(TimeoutKind::DoViewChangeMessage);
 
-        let current_op = self.sequencer.current_sequence();
-        let action = VsrAction::SendDoViewChange {
-            view: self.view.get(),
-            target: self.primary_index(self.view.get()),
-            log_view: self.log_view.get(),
-            op: current_op,
-            // commit_max clamped to op: see `handle_start_view_change`.
-            commit: self.commit_max.get().min(current_op),
-            namespace: self.namespace,
-        };
+        // NOT the snapshot the first send used: `build_do_view_change` re-reads
+        // `local_dvc_suffix()`, whose `(op, commit)` tag can have moved since, in
+        // which case it answers EMPTY, retracting every nack and body offer already
+        // sent. Survivable only because `dvc_record` drops a duplicate sender, so the
+        // candidate keeps the first vote. Allow a retransmit to replace a seated vote
+        // and this must pin the snapshot instead.
+        let action = self.build_do_view_change(self.primary_index(self.view.get()));
         emit_sim_event(
             SimEventKind::ControlMessageScheduled,
             &ControlActionLogEvent::from_vsr_action(
@@ -1650,7 +2395,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         let action = VsrAction::SendStartViewChange {
             view: next_view,
-            namespace: self.namespace,
+            group: self.group,
         };
         emit_sim_event(
             SimEventKind::ControlMessageScheduled,
@@ -1693,24 +2438,27 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Only acts on the primary in normal status with a non-empty pipeline.
     /// Resets the timeout with backoff on each firing.
     fn handle_prepare_timeout(&self) -> Vec<VsrAction> {
-        // TODO(prepare-timeout): tighten the timer lifecycle: disarm in
-        // the ack path the moment quorum drains the pipeline and rearm
-        // for the next-oldest prepare when one commits with others still
-        // pending, giving the invariant "ticking iff pipeline non-empty"
-        // and a timeout that always measures the current oldest
-        // prepare's age. Ours arms once per idle->busy transition and
-        // disarms lazily below, so a prepare pushed late into an armed
-        // window can be retransmitted before it is `PREPARE_TICKS` old.
-        // Also worth special-casing "all remote acks present, own
-        // journal write is the laggard" by retrying the local write
-        // instead of retransmitting.
+        // The timer's lifecycle is maintained at the pipeline's own edges
+        // (`push_prepare_entry` arms, `sync_prepare_timeout` disarms on empty and
+        // restarts on a new head), so by the time this fires the timer is already
+        // measuring the current oldest prepare rather than inheriting a drained
+        // entry's elapsed ticks. The stop below is now a backstop for a pipeline
+        // emptied by a path that skipped that maintenance, not the primary
+        // disarm.
+        //
+        // TODO(prepare-timeout): special-case "all remote acks present, own
+        // journal write is the laggard" by retrying the local write instead of
+        // retransmitting to peers that already acked.
         //
         // Every early return below must stop or back off the timeout.
         // `fired()` stays true until the timer is rearmed, so returning
         // with the fired state intact turns the next pipeline push into
         // an instant spurious retransmit on the following tick (the push
         // sees `is_ticking` and does not restart the timer).
-        if !self.is_primary() || self.status.get() != Status::Normal {
+        // A replica that ceded at boot (`init_as_backup`) is a backup by role however
+        // the view math reads, so it must not retransmit either.
+        if !self.is_primary() || self.status.get() != Status::Normal || self.has_ceded_primaryship()
+        {
             self.timeouts.borrow_mut().stop(TimeoutKind::Prepare);
             return Vec::new();
         }
@@ -1748,6 +2496,26 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
+        // A primary-by-index that has seen a newer view is stale: the cluster
+        // elected past it while it was gone, and it booted primary-by-index at
+        // an old view (a fresh or rejoined node that missed the election). It
+        // has no `NormalHeartbeat` timeout to catch this -- it IS the heartbeat
+        // sender -- so convert here instead of advertising a commit point no
+        // peer will accept. The probe solicits the current `StartView`, which
+        // demotes this replica to a backup and routes into repair / state
+        // transfer. `begin_view_probe` stops this timer.
+        if self.observed_newer_view.get() > self.view.get() {
+            tracing::info!(
+                replica = self.replica,
+                namespace_raw = self.group,
+                view = self.view.get(),
+                observed_newer_view = self.observed_newer_view.get(),
+                "stale primary-by-index behind a newer view; probing to catch up"
+            );
+            self.begin_view_probe();
+            return Vec::new();
+        }
+
         self.timeouts.borrow_mut().reset(TimeoutKind::CommitMessage);
 
         // Don't advertise a commit point we haven't locally executed yet.
@@ -1760,7 +2528,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         vec![VsrAction::SendCommit {
             view: self.view.get(),
             commit: self.commit_min.get(),
-            namespace: self.namespace,
+            group: self.group,
             timestamp_monotonic: ts,
         }]
     }
@@ -1772,16 +2540,13 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// that will be the primary in the new view."
     ///
     /// # Panics
-    /// If `header.namespace` does not match this replica's namespace.
+    /// If `header.group` does not match this replica's namespace.
     pub fn handle_start_view_change(
         &self,
         plane: PlaneKind,
         header: &StartViewChangeHeader,
     ) -> Vec<VsrAction> {
-        assert_eq!(
-            header.namespace, self.namespace,
-            "SVC routed to wrong group"
-        );
+        assert_eq!(header.group, self.group, "SVC routed to wrong group");
         // A recovering replica is quorum-invisible: it lost (or cannot trust)
         // its durable state, so it must not vote history into existence. The
         // election proceeds among the peers; its conclusion reaches this
@@ -1801,47 +2566,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         // If SVC is for a higher view, advance to that view
         if msg_view > self.view.get() {
-            let old_view = self.view.get();
-            self.view.set(msg_view);
-            self.status.set(Status::ViewChange);
-            self.reset_view_change_state();
-            self.sent_own_start_view_change.set(true);
-            self.start_view_change_from_all_replicas
-                .borrow_mut()
-                .insert(self.replica as usize);
-
-            // Update timeouts
-            {
-                let mut timeouts = self.timeouts.borrow_mut();
-                timeouts.stop(TimeoutKind::NormalHeartbeat);
-                timeouts.start(TimeoutKind::StartViewChangeMessage);
-                timeouts.start(TimeoutKind::ViewChangeStatus);
-                timeouts.start(TimeoutKind::RequestStartViewMessage);
-            }
-
-            emit_sim_event(
-                SimEventKind::ViewChangeStarted,
-                &ViewChangeLogEvent {
-                    replica: ReplicaLogContext::from_consensus(self, plane),
-                    old_view,
-                    new_view: msg_view,
-                    reason: ViewChangeReason::ReceivedStartViewChange,
-                },
-            );
-
-            // Send our own SVC
-            let action = VsrAction::SendStartViewChange {
-                view: msg_view,
-                namespace: self.namespace,
-            };
-            emit_sim_event(
-                SimEventKind::ControlMessageScheduled,
-                &ControlActionLogEvent::from_vsr_action(
-                    ReplicaLogContext::from_consensus(self, plane),
-                    &action,
-                ),
-            );
-            actions.push(action);
+            actions.extend(self.enter_view_change(
+                plane,
+                msg_view,
+                ViewChangeReason::ReceivedStartViewChange,
+            ));
         }
 
         // Record the SVC from sender
@@ -1858,36 +2587,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
             let primary_candidate = self.primary_index(self.view.get());
             let current_op = self.sequencer.current_sequence();
-            // DVC carries commit_max (highest known-committed), not commit_min
-            // (locally applied). The new primary floors its pipeline rebuild at
-            // max(commit) across the quorum; only commit_max bounds that range
-            // to pipeline depth (every replica holds op - commit_max <= depth).
-            // commit_min can lag far behind and overflow the rebuild. The
-            // committed-but-unapplied tail (commit_min..commit_max] is replayed
-            // by the new primary's CommitJournal, not the pipeline.
-            //
-            // Clamp to op: a backup learns commit_max from a heartbeat before
-            // receiving the prepares, so commit_max can exceed its op. The wire
-            // contract `DoViewChangeHeader::validate` rejects commit > op and
-            // drops such a DVC (view-change liveness stall). The clamp is
-            // lossless for the rebuild floor: quorum intersection guarantees
-            // some sender whose op covers the true commit point carries it, so
-            // max(commit) across the quorum is unchanged.
-            let commit = self.commit_max.get().min(current_op);
+            let commit = self.dvc_commit();
 
             // Start DVC timeout
             self.timeouts
                 .borrow_mut()
                 .start(TimeoutKind::DoViewChangeMessage);
 
-            let action = VsrAction::SendDoViewChange {
-                view: self.view.get(),
-                target: primary_candidate,
-                log_view: self.log_view.get(),
-                op: current_op,
-                commit,
-                namespace: self.namespace,
-            };
+            let action = self.build_do_view_change(primary_candidate);
             emit_sim_event(
                 SimEventKind::ControlMessageScheduled,
                 &ControlActionLogEvent::from_vsr_action(
@@ -1904,15 +2611,19 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                     log_view: self.log_view.get(),
                     op: current_op,
                     commit,
+                    suffix: self.local_dvc_suffix(),
                 };
                 dvc_record(
                     &mut self.do_view_change_from_all_replicas.borrow_mut(),
                     own_dvc,
                 );
 
-                // Check if we now have quorum
-                if dvc_count(&self.do_view_change_from_all_replicas.borrow()) >= self.quorum() {
-                    self.do_view_change_quorum.set(true);
+                // `complete_view_change_as_primary` latches only once the merge
+                // decides, so an undecidable quorum stays open to later DVCs.
+                if !self.do_view_change_quorum.get()
+                    && dvc_count(&self.do_view_change_from_all_replicas.borrow())
+                        >= self.quorum_view_change()
+                {
                     actions.extend(self.complete_view_change_as_primary(plane));
                 }
             }
@@ -1927,17 +2638,77 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// replicas (including itself), it sets its view-number to that in the messages
     /// and selects as the new log the one contained in the message with the largest v'..."
     ///
+    /// The `commit` this replica advertises in a `DoViewChange`.
+    ///
+    /// `commit_max`, not `commit_min`: the new primary floors its pipeline rebuild
+    /// at `max(commit)` across the quorum, and only `commit_max` bounds that range
+    /// to the pipeline depth. `commit_min` can lag far enough to overflow the
+    /// rebuild; `CommitJournal` replays the committed-but-unapplied tail instead.
+    ///
+    /// Clamped to `op`, since a backup learns `commit_max` from a heartbeat before
+    /// the prepares and `DoViewChangeHeader::validate` rejects `commit > op`.
+    /// Lossless for the rebuild floor: quorum intersection guarantees some sender
+    /// whose head covers the true commit point carries it.
+    fn dvc_commit(&self) -> u64 {
+        let op = self.sequencer.current_sequence();
+        self.commit_max.get().min(op)
+    }
+
+    /// Build this replica's `DoViewChange` for the current view.
+    fn build_do_view_change(&self, target: u8) -> VsrAction {
+        VsrAction::SendDoViewChange {
+            view: self.view.get(),
+            target,
+            log_view: self.log_view.get(),
+            op: self.sequencer.current_sequence(),
+            commit: self.dvc_commit(),
+            group: self.group,
+            suffix: self.local_dvc_suffix(),
+        }
+    }
+
+    /// Decode a peer's suffix, or `None` to drop the whole `DoViewChange`.
+    ///
+    /// A suffix that will not decode makes the numbers untrustworthy too. Dropping
+    /// the message lets the sender's retransmit try again, rather than seating a
+    /// vote whose nacks and offered bodies cannot be placed against an op.
+    fn decode_peer_suffix(
+        &self,
+        header: &DoViewChangeHeader,
+        suffix_body: &[u8],
+    ) -> Option<DvcSuffix> {
+        match dvc_suffix_decode(
+            suffix_body,
+            header.op,
+            header.nack_bitset,
+            header.present_bitset,
+        ) {
+            Ok(suffix) => Some(suffix),
+            Err(error) => {
+                tracing::warn!(
+                    replica = self.replica,
+                    from_replica = header.replica,
+                    view = header.view,
+                    op = header.op,
+                    "dropping do_view_change with an unreadable suffix: {error}"
+                );
+                None
+            }
+        }
+    }
+
+    /// `suffix_body` is the sender's uncommitted-suffix headers. Empty from a peer
+    /// unable to snapshot one, which then contributes numbers only.
+    ///
     /// # Panics
-    /// If `header.namespace` does not match this replica's namespace.
+    /// If `header.group` does not match this replica's namespace.
     pub fn handle_do_view_change(
         &self,
         plane: PlaneKind,
         header: &DoViewChangeHeader,
+        suffix_body: &[u8],
     ) -> Vec<VsrAction> {
-        assert_eq!(
-            header.namespace, self.namespace,
-            "DVC routed to wrong group"
-        );
+        assert_eq!(header.group, self.group, "DVC routed to wrong group");
         // Quorum-invisible while recovering (see handle_start_view_change):
         // a recovering replica must not collect DVCs and crown itself.
         if self.status.get() == Status::Recovering {
@@ -1948,6 +2719,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         let msg_log_view = header.log_view;
         let msg_op = header.op;
         let msg_commit = header.commit;
+        let Some(msg_suffix) = self.decode_peer_suffix(header, suffix_body) else {
+            return Vec::new();
+        };
 
         // Ignore DVCs for old views
         if msg_view < self.view.get() {
@@ -1958,47 +2732,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         // If DVC is for a higher view, advance to that view
         if msg_view > self.view.get() {
-            let old_view = self.view.get();
-            self.view.set(msg_view);
-            self.status.set(Status::ViewChange);
-            self.reset_view_change_state();
-            self.sent_own_start_view_change.set(true);
-            self.start_view_change_from_all_replicas
-                .borrow_mut()
-                .insert(self.replica as usize);
-
-            // Update timeouts
-            {
-                let mut timeouts = self.timeouts.borrow_mut();
-                timeouts.stop(TimeoutKind::NormalHeartbeat);
-                timeouts.start(TimeoutKind::StartViewChangeMessage);
-                timeouts.start(TimeoutKind::ViewChangeStatus);
-                timeouts.start(TimeoutKind::RequestStartViewMessage);
-            }
-
-            emit_sim_event(
-                SimEventKind::ViewChangeStarted,
-                &ViewChangeLogEvent {
-                    replica: ReplicaLogContext::from_consensus(self, plane),
-                    old_view,
-                    new_view: msg_view,
-                    reason: ViewChangeReason::ReceivedDoViewChange,
-                },
-            );
-
-            // Send our own SVC
-            let action = VsrAction::SendStartViewChange {
-                view: msg_view,
-                namespace: self.namespace,
-            };
-            emit_sim_event(
-                SimEventKind::ControlMessageScheduled,
-                &ControlActionLogEvent::from_vsr_action(
-                    ReplicaLogContext::from_consensus(self, plane),
-                    &action,
-                ),
-            );
-            actions.push(action);
+            actions.extend(self.enter_view_change(
+                plane,
+                msg_view,
+                ViewChangeReason::ReceivedDoViewChange,
+            ));
         }
 
         // Only the primary candidate processes DVCs for quorum
@@ -2024,6 +2762,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 log_view: self.log_view.get(),
                 op: current_op,
                 commit,
+                suffix: self.local_dvc_suffix(),
             };
             dvc_record(
                 &mut self.do_view_change_from_all_replicas.borrow_mut(),
@@ -2037,14 +2776,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             log_view: msg_log_view,
             op: msg_op,
             commit: msg_commit,
+            suffix: msg_suffix,
         };
         dvc_record(&mut self.do_view_change_from_all_replicas.borrow_mut(), dvc);
 
-        // Check if quorum achieved
+        // `complete_view_change_as_primary` latches only once the merge decides,
+        // so an undecidable quorum re-merges as each further DVC lands.
         if !self.do_view_change_quorum.get()
-            && dvc_count(&self.do_view_change_from_all_replicas.borrow()) >= self.quorum()
+            && dvc_count(&self.do_view_change_from_all_replicas.borrow())
+                >= self.quorum_view_change()
         {
-            self.do_view_change_quorum.set(true);
             actions.extend(self.complete_view_change_as_primary(plane));
         }
 
@@ -2065,7 +2806,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     pub fn begin_view_probe(&self) {
         tracing::info!(
             replica = self.replica,
-            namespace_raw = self.namespace,
+            namespace_raw = self.group,
             "beginning view probe"
         );
         self.status.set(Status::Recovering);
@@ -2075,6 +2816,52 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         timeouts.stop(TimeoutKind::CommitMessage);
         timeouts.stop(TimeoutKind::NormalHeartbeat);
         timeouts.start(TimeoutKind::RequestStartViewMessage);
+    }
+
+    /// Arm state transfer for a cluster restart: the replica will replace
+    /// its snapshot-shaped state from the live primary the view probe finds
+    /// (the shard's transfer session drives the stage from there). If the
+    /// probe exhausts instead -- full-cluster bootstrap, nobody to fetch
+    /// from -- the election fallback clears the stage and local recovery
+    /// stands.
+    pub fn begin_state_transfer_await(&self) {
+        self.set_state_transfer_stage(StateTransferStage::AwaitingTarget);
+    }
+
+    /// Record that a message stamped with `view` arrived that this replica
+    /// could not process because the view is ahead of its own. Monotone: only
+    /// a value strictly above the current record moves it. Called from the two
+    /// ingress paths that drop newer-view traffic (`handle_commit` and
+    /// `replicate_preflight`); read by the heartbeat-timeout handler to choose
+    /// catch-up over election.
+    pub fn observe_newer_view(&self, view: u32) {
+        if view > self.observed_newer_view.get() {
+            self.observed_newer_view.set(view);
+        }
+    }
+
+    #[must_use]
+    pub const fn state_transfer_stage(&self) -> StateTransferStage {
+        self.state_transfer_stage.get()
+    }
+
+    /// # Panics
+    /// On an illegal stage transition (see
+    /// [`StateTransferStage::valid_transition`]).
+    pub fn set_state_transfer_stage(&self, to: StateTransferStage) {
+        let from = self.state_transfer_stage.get();
+        assert!(
+            StateTransferStage::valid_transition(from, to),
+            "state transfer stage transition {from:?} -> {to:?} is illegal"
+        );
+        tracing::info!(
+            replica = self.replica,
+            namespace_raw = self.group,
+            ?from,
+            ?to,
+            "state transfer stage"
+        );
+        self.state_transfer_stage.set(to);
     }
 
     /// Peer side of the probe (sent by a Recovering replica at boot, or by
@@ -2095,7 +2882,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         header: &RequestStartViewHeader,
     ) -> Vec<VsrAction> {
         assert_eq!(
-            header.namespace, self.namespace,
+            header.group, self.group,
             "RequestStartView routed to wrong group"
         );
         if self.status.get() != Status::Normal {
@@ -2125,11 +2912,21 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         if self.log_view.get() != self.view.get() {
             return Vec::new();
         }
+        // Echo the requester's incarnation so it can prove this StartView
+        // post-dates its restart (a probe reply, not a stale in-flight message).
+        // Addressed to the requester alone: the nonce proves freshness for that
+        // replica only, and a peer recovering at the same time would read it as
+        // foreign and reject a StartView that is in fact current.
         vec![VsrAction::SendStartView {
             view: self.view.get(),
             op: self.sequencer.current_sequence(),
             commit: self.commit_max.get(),
-            namespace: self.namespace,
+            incarnation: header.incarnation,
+            target: Some(header.replica),
+            // A probe answer reports this primary's settled frontier, not a
+            // freshly merged log, so there is no canonical suffix to publish.
+            suffix: Vec::new(),
+            group: self.group,
         }]
     }
 
@@ -2158,6 +2955,44 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             .stop(TimeoutKind::RequestStartViewMessage);
     }
 
+    /// Decide which head to adopt from a `StartView`, and record the view's
+    /// canonical headers when it carried any.
+    ///
+    /// Headers go in `pending_view_log`, not the journal: a journal entry is a
+    /// header plus its body, and a backup adopting a view usually holds neither.
+    /// Keeping them lets the repair ingest reject a body that disagrees with what
+    /// the view decided, which is what makes fetching by op number safe.
+    ///
+    /// Falls back to the announced `op` on an empty body (probe answer, stale-view
+    /// correction).
+    fn adopt_start_view_suffix(&self, header: &StartViewHeader, suffix_body: &[u8]) -> u64 {
+        let suffix = match dvc_suffix_decode(suffix_body, header.op, 0, 0) {
+            Ok(suffix) => suffix,
+            Err(error) => {
+                tracing::warn!(
+                    replica = self.replica,
+                    from_replica = header.replica,
+                    view = header.view,
+                    op = header.op,
+                    "start_view suffix did not decode, falling back to the announced op: {error}"
+                );
+                return header.op;
+            }
+        };
+        let headers = suffix.headers();
+        if headers.is_empty() {
+            return header.op;
+        }
+
+        *self.pending_view_log.borrow_mut() = Some(MergedLog {
+            op_head: header.op,
+            commit_max: header.commit,
+            headers: headers.to_vec(),
+            committed_elsewhere: Vec::new(),
+        });
+        header.op
+    }
+
     /// Handle a received `StartView` message (backups only).
     ///
     /// "When other replicas receive the STARTVIEW message, they replace their log
@@ -2166,7 +3001,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// their status to normal, and send `PrepareOK` for any uncommitted ops."
     ///
     /// # Panics
-    /// If `header.namespace` does not match this replica's namespace.
+    /// If `header.group` does not match this replica's namespace.
     /// # Client-table maintenance
     ///
     /// Backups maintain the client-table during normal operation via
@@ -2176,8 +3011,15 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     ///
     /// Gap: if a backup never received a prepare (lost message),
     /// `commit_journal` stops at the gap. Requires message repair.
-    pub fn handle_start_view(&self, plane: PlaneKind, header: &StartViewHeader) -> Vec<VsrAction> {
-        assert_eq!(header.namespace, self.namespace, "SV routed to wrong group");
+    /// `suffix_body` is the message body: the view's canonical headers, empty
+    /// when the announcement carries numbers only.
+    pub fn handle_start_view(
+        &self,
+        plane: PlaneKind,
+        header: &StartViewHeader,
+        suffix_body: &[u8],
+    ) -> Vec<VsrAction> {
+        assert_eq!(header.group, self.group, "SV routed to wrong group");
         let from_replica = header.replica;
         let msg_view = header.view;
         let msg_op = header.op;
@@ -2193,11 +3035,61 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             return Vec::new();
         }
 
-        // Skip equal-view SV with old op.
-        // Already in this view; re-running reset_view_change_state would
-        // cancel subscribers (waking register awaiters Canceled) and clear
-        // pipeline for nothing. log_view (not self.view) tracks last-normal view.
-        if msg_view == self.log_view.get() && msg_op < self.sequencer.current_sequence() {
+        // Incarnation guard. While Recovering (probing after a restart), only adopt
+        // a StartView that is provably post-restart: a strictly newer view, a head
+        // at or past ours, or one echoing our current incarnation (a reply to our
+        // own probe). Otherwise it may be addressed to a previous incarnation still
+        // in flight, and adopting it could install a stale head and let this replica
+        // act in a view it will not remember after another crash. Inert when no
+        // incarnation is set (partition plane, tests).
+        //
+        // A zero `header.incarnation` makes no claim either way: it is what an
+        // unsolicited StartView carries.
+        // Classifying it stale would have this replica reject a current StartView
+        // from a healthy primary purely because that primary is older, so it falls
+        // through to the view checks that governed before the field existed.
+        let self_incarnation = self.incarnation.get();
+        if self.status.get() == Status::Recovering
+            && self_incarnation != 0
+            && header.incarnation != 0
+            && msg_view <= self.view.get()
+            && msg_op < self.sequencer.current_sequence()
+            && header.incarnation != self_incarnation
+        {
+            tracing::debug!(
+                replica = self.replica,
+                view = msg_view,
+                op = msg_op,
+                incarnation = header.incarnation,
+                self_incarnation,
+                "ignoring StartView while recovering: stale incarnation"
+            );
+            return Vec::new();
+        }
+
+        // Skip an equal-view StartView whose op is below our COMMITTED floor. Such a
+        // message can only be stale: a live primary's head covers every op it ever
+        // told us was committed. Already in this view, so re-running
+        // reset_view_change_state for one would cancel subscribers (waking register
+        // awaiters Canceled) and clear the pipeline for nothing. log_view (not
+        // self.view) tracks the last-normal view.
+        //
+        // The bound is deliberately the commit floor and NOT the sequencer head.
+        // Adopting a StartView drops the head (below) without truncating the WAL, so
+        // a replica that adopted at head H and then restarted re-derives a LONGER
+        // head from its own journal while log_view stays at that same view. Skipping
+        // on the head would drop the primary's StartView there -- including the reply
+        // echoing this replica's own probe -- leaving it to time the probe out and
+        // elect instead, with a DoViewChange of (log_view, discarded_head) that
+        // outranks the real primary's and pushes ops that view already discarded back
+        // over committed bodies.
+        //
+        // TODO(suffix-truncation): re-adoption drops the head again, but the WAL
+        // still holds the discarded suffix, so the primary's next prepare lands on an
+        // op that suffix already occupies and fails `append`'s slot-collision check,
+        // poisoning the journal. Loud beats the silent divergence above; a durable
+        // truncate-from-op primitive is what actually closes it.
+        if msg_view == self.log_view.get() && msg_op < self.commit_min() {
             return Vec::new();
         }
 
@@ -2229,11 +3121,11 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // Stale pipeline entries from the old view must be discarded
         self.pipeline.borrow_mut().clear();
 
-        // TODO: StartView should carry uncommitted headers so backup installs
-        // into WAL and sets op WAL-verified. Today we trust msg_op, correct
-        // for truncation (sequencer > msg_op) but wrong when behind
-        // (sequencer < msg_op): gap is unreachable without message repair.
-        self.sequencer.set_sequence(msg_op);
+        // Cross-check the announced head against the headers published with it: a
+        // suffix head disagreeing with `header.op` means an inconsistently built
+        // frame, and either value leaves this replica chasing an unservable head.
+        let announced = self.adopt_start_view_suffix(header, suffix_body);
+        self.sequencer.set_sequence(announced);
 
         // Update timeouts for normal backup operation
         {
@@ -2265,7 +3157,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
                 from_op: msg_commit + 1,
                 to_op: msg_op,
                 target: from_replica,
-                namespace: self.namespace,
+                group: self.group,
             };
             emit_sim_event(
                 SimEventKind::ControlMessageScheduled,
@@ -2289,12 +3181,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// to prevent old/replayed messages from suppressing view changes.
     ///
     /// # Panics
-    /// If `header.namespace` does not match this replica's namespace.
+    /// If `header.group` does not match this replica's namespace.
     pub fn handle_commit(&self, header: &iggy_binary_protocol::CommitHeader) -> CommitOutcome {
-        assert_eq!(
-            header.namespace, self.namespace,
-            "Commit routed to wrong group"
-        );
+        assert_eq!(header.group, self.group, "Commit routed to wrong group");
 
         if self.is_primary() {
             // A heartbeat from the primary of an OLDER view means that
@@ -2313,6 +3202,12 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
             {
                 return CommitOutcome::RespondStartView;
             }
+            // A "primary" hearing a NEWER view is stale-by-index: the cluster
+            // elected past it. Record so its heartbeat-send timer converts to
+            // a probe (see `handle_commit_message_timeout`).
+            if header.view > self.view.get() {
+                self.observe_newer_view(header.view);
+            }
             return CommitOutcome::Accepted;
         }
 
@@ -2321,12 +3216,18 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
 
         if header.view != self.view.get() {
+            // A heartbeat from a newer view is proof the cluster elected past
+            // this replica. Record it so the heartbeat-timeout handler probes
+            // to catch up instead of electing (this same heartbeat cannot
+            // reset the timer -- the reset below is gated on a matching view).
+            if header.view > self.view.get() {
+                self.observe_newer_view(header.view);
+            }
             return CommitOutcome::Accepted;
         }
 
-        // TODO: Once connection-level peer verification is added promote
-        // this to an assert, the network layer would guarantee the sender
-        // matches header.replica.
+        // Tolerant skip, not an assert: the replica handshake proves cluster
+        // membership only, so nothing binds `header.replica` to the sender.
         if header.replica != self.primary_index(header.view) {
             return CommitOutcome::Accepted;
         }
@@ -2359,22 +3260,83 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// contains entries for all committed ops it received.
     ///
     /// Gap: missing prepares (lost messages) require message repair.
+    ///
+    /// Re-entrant, called again for every `DoViewChange` landing while the merge is
+    /// undecided. Every non-`Ready` outcome leaves this replica untouched, so a
+    /// re-run costs only the merge.
     fn complete_view_change_as_primary(&self, plane: PlaneKind) -> Vec<VsrAction> {
-        let dvc_array = self.do_view_change_from_all_replicas.borrow();
-
-        let Some(winner) = dvc_select_winner(&dvc_array) else {
-            return Vec::new();
+        let merged = {
+            let dvc_array = self.do_view_change_from_all_replicas.borrow();
+            merge_dvc_quorum(&dvc_array, self.merge_quorums())
         };
 
-        let new_op = winner.op;
-        let max_commit = dvc_max_commit(&dvc_array);
+        let merged = match merged {
+            MergeOutcome::Ready(merged) => merged,
+            // Every non-ready outcome keeps this replica in `ViewChange` with its
+            // log untouched. Picking a winner unconditionally and letting the
+            // pipeline rebuild truncate what it cannot find locally discards
+            // committed ops; an unavailable cluster that says so is the better
+            // failure.
+            //
+            // None of these latch `do_view_change_quorum`: an undecidable quorum is
+            // not a decision, and the replicas still to report are what would
+            // settle it. The flag belongs only where the quorum is decidable.
+            MergeOutcome::AwaitingQuorum => return Vec::new(),
+            MergeOutcome::AwaitingRepair { undecided_op } => {
+                tracing::debug!(
+                    replica = self.replica,
+                    view = self.view.get(),
+                    undecided_op,
+                    "view change waiting on more DoViewChange messages to decide an op"
+                );
+                return Vec::new();
+            }
+            MergeOutcome::Deadlocked { undecided_op } => {
+                tracing::error!(
+                    replica = self.replica,
+                    view = self.view.get(),
+                    undecided_op,
+                    "view change cannot start: op {undecided_op} is neither recoverable from any \
+                     replica nor provably uncommitted"
+                );
+                return Vec::new();
+            }
+        };
 
-        // Update state
-        self.log_view.set(self.view.get());
-        self.status.set(Status::Normal);
-        self.ceded_primaryship.set(false);
+        // The pipeline must hold the whole uncommitted range, and the merge decides
+        // that range against a cluster-wide ceiling, so a node configured shallower
+        // than its peers can be handed a range it cannot rebuild.
+        //
+        // Refuse rather than panic: a further DoViewChange can raise `commit_max`
+        // and shrink the range, and otherwise the status timeout escalates. A panic
+        // would restart into the same merge.
+        if merged.op_head.saturating_sub(merged.commit_max) > self.prepare_queue_max as u64 {
+            tracing::error!(
+                replica = self.replica,
+                view = self.view.get(),
+                commit_max = merged.commit_max,
+                op_head = merged.op_head,
+                prepare_queue_max = self.prepare_queue_max,
+                "view change cannot start: the merged log claims {} in-flight ops, more than this \
+                 replica's pipeline holds; refusing the view",
+                merged.op_head - merged.commit_max,
+            );
+            return Vec::new();
+        }
+
+        // Quorum closed now the merge decided: re-merging after parking could
+        // produce a different log than the one already being repaired toward.
+        self.do_view_change_quorum.set(true);
+
+        // The merged log is authoritative but this replica may not hold every body
+        // yet. Park it, let the shard repair up to it, and `start_pending_view`
+        // finishes once the journal covers the range. Until then this replica stays
+        // in `ViewChange` and prepares nothing, so no client op is stamped onto an
+        // unproven log. `log_view` does NOT advance here; see `start_pending_view`.
+        let max_commit = merged.commit_max;
+        let new_op = merged.op_head;
         self.advance_commit_max(max_commit);
-        self.sequencer.set_sequence(new_op);
+        *self.pending_view_log.borrow_mut() = Some(merged);
 
         // Stale pipeline entries are invalid in new view; reconciliation
         // replays from journal.
@@ -2393,6 +3355,137 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // but this path fires within the current view after DVC quorum -- so we clear
         // the loopback queue directly.
         self.loopback_queue.borrow_mut().clear();
+
+        tracing::info!(
+            replica = self.replica,
+            view = self.view.get(),
+            op_head = new_op,
+            commit_max = max_commit,
+            "view-change quorum merged; repairing up to the merged log before starting the view"
+        );
+        emit_replica_event(
+            SimEventKind::ReplicaStateChanged,
+            &ReplicaLogContext::from_consensus(self, plane),
+        );
+
+        // No sends yet: `SendStartView` promises this replica can serve every op in
+        // the merged log, and a backup adopting the announced head asks it for the
+        // bodies behind it.
+        Vec::new()
+    }
+
+    /// Sizes handed to the DVC merge.
+    const fn merge_quorums(&self) -> MergeQuorums {
+        MergeQuorums {
+            view_change: self.quorum_view_change(),
+            nack_prepare: self.quorum_nack_prepare(),
+            replica_count: self.replica_count as usize,
+            // The cluster-wide ceiling, not `self.prepare_queue_max`: this node's
+            // config says nothing about how deep a peer's pipeline is.
+            prepare_queue_ceiling: PREPARE_QUEUE_CEILING as u64,
+        }
+    }
+
+    /// The merged log this replica is repairing toward, if a view change is
+    /// mid-transition. The shard reads it for the op range it must cover before the
+    /// view can start, and for which peers offered the bodies.
+    ///
+    /// Clones two `Vec<PrepareHeader>`. Prefer [`Self::view_log_is_pending`] /
+    /// [`Self::with_pending_view_log`]; clone only to hold it across an `.await` or
+    /// across [`Self::start_pending_view`], which takes the cell.
+    #[must_use]
+    pub fn pending_view_log(&self) -> Option<MergedLog> {
+        self.pending_view_log.borrow().clone()
+    }
+
+    /// Whether a merge is parked, without cloning it.
+    #[must_use]
+    pub fn view_log_is_pending(&self) -> bool {
+        self.pending_view_log.borrow().is_some()
+    }
+
+    /// Read the parked merge in place. The closure must not re-enter consensus: the
+    /// `RefCell` stays borrowed for its whole body.
+    pub fn with_pending_view_log<T>(&self, read: impl FnOnce(&MergedLog) -> T) -> Option<T> {
+        self.pending_view_log.borrow().as_ref().map(read)
+    }
+
+    /// Replicas that offered a body for `op`, most-recent-log_view first.
+    ///
+    /// Only meaningful while a merge is parked. These peers and nobody else: a
+    /// cleared present bit means the body was never held or cannot be read back,
+    /// and the view change is blocked on the round-trip.
+    #[must_use]
+    pub fn pending_view_body_sources(&self, op: u64) -> Vec<u8> {
+        let quorum = self.do_view_change_from_all_replicas.borrow();
+        let mut sources: Vec<(u32, u8)> = dvc_iter(&quorum)
+            .filter(|dvc| dvc.replica != self.replica)
+            .filter_map(|dvc| {
+                let index = dvc.suffix.index_of(dvc.op, op)?;
+                dvc.suffix
+                    .offers_body(index)
+                    .then_some((dvc.log_view, dvc.replica))
+            })
+            .collect();
+        sources.sort_unstable_by_key(|(log_view, _)| std::cmp::Reverse(*log_view));
+        sources.into_iter().map(|(_, replica)| replica).collect()
+    }
+
+    /// Finish the parked view change: this replica's journal now covers the merged
+    /// log, so it can serve any op it is about to announce.
+    ///
+    /// Called by the shard after repair progress. No-op when nothing is parked.
+    ///
+    /// # Panics
+    /// If the merged uncommitted range exceeds pipeline capacity, which needs a head
+    /// more than one pipeline depth above the proven commit point.
+    pub fn start_pending_view(&self, plane: PlaneKind) -> Vec<VsrAction> {
+        // A backup's parked log (the `StartView` suffix) is only what its ingest
+        // verifies bodies against. It must never take this path: starting the view
+        // claims the primaryship of a view this replica did not win.
+        if !self.is_primary_for_view(self.view.get()) {
+            return Vec::new();
+        }
+        let Some(merged) = self.pending_view_log.borrow_mut().take() else {
+            return Vec::new();
+        };
+        let new_op = merged.op_head;
+        let max_commit = merged.commit_max;
+
+        // The one view-change exit that skips `reset_view_change_state`, so the DVCs
+        // (a suffix `Vec` per sender, per group led) would be held for the whole
+        // primaryship. Nothing reads the array after the view starts: a late
+        // same-view DVC returns at the status gate, a higher-view one resets first.
+        //
+        // `dvc_reset`, not `reset_dvc_quorum`: the latter also clears the
+        // `do_view_change_quorum` latch, which from here means "log decided" and is
+        // what stops `handle_do_view_change_timeout` retransmitting.
+        dvc_reset(&mut self.do_view_change_from_all_replicas.borrow_mut());
+        self.invalidate_local_dvc_suffix();
+
+        self.status.set(Status::Normal);
+        self.ceded_primaryship.set(false);
+        self.sequencer.set_sequence(new_op);
+        if let Some(head) = merged.headers.first() {
+            // Keep the hash chain continuous: the next prepare must chain onto the
+            // head this view adopted, not onto whatever was appended last.
+            self.set_last_prepare_checksum(head.checksum);
+        }
+        for header in &merged.headers {
+            self.observe_prepare_timestamp(header.timestamp);
+        }
+        // Only now, with the merged head installed above. `log_view` claims "my log
+        // IS the log this view decided", and it selects the canonical senders of the
+        // next view change, whose headers outrank everyone else's.
+        //
+        // Raising it at merge time breaks that claim for the whole parked window,
+        // which can end in supersession or a crash (`log_view` is durable): the
+        // replica then votes as canonical carrying its own stale head, and ops the
+        // merge decided to keep fall outside the next scan range, discarded with no
+        // nack required. Merge-time assignment is only truthful where every merged
+        // header is installed there; parking installs nothing and the repair ingest
+        // only fills holes, so a parked replica still holds its old view's log.
+        self.log_view.set(self.view.get());
 
         // Update timeouts for normal primary operation
         {
@@ -2413,11 +3506,18 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         emit_replica_event(SimEventKind::PrimaryElected, &state);
         emit_replica_event(SimEventKind::ReplicaStateChanged, &state);
 
+        // Unsolicited StartView at view-change completion: no probe to answer,
+        // so it carries no incarnation (freshness comes from the newer view) and
+        // goes to every backup.
         let action = VsrAction::SendStartView {
             view: self.view.get(),
             op: new_op,
             commit: max_commit,
-            namespace: self.namespace,
+            incarnation: 0,
+            target: None,
+            group: self.group,
+            // `merged` was taken out of the parked slot, so hand the headers over.
+            suffix: merged.headers,
         };
         emit_sim_event(
             SimEventKind::ControlMessageScheduled,
@@ -2435,14 +3535,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         // The new primary must rebuild its pipeline from the journal so that
         // incoming PrepareOk messages can be matched and commits can proceed.
         if max_commit < new_op {
-            assert!(
-                (new_op - max_commit) <= PIPELINE_PREPARE_QUEUE_MAX as u64,
+            // `complete_view_change_as_primary` already refused a non-fitting
+            // range. Asserted so the sites cannot drift; this one cannot decline.
+            debug_assert!(
+                (new_op - max_commit) <= self.prepare_queue_max as u64,
                 "view change: uncommitted range {}..={} ({} ops) exceeds pipeline capacity ({}); \
-                 DVC winner claims more in-flight ops than the pipeline can hold",
+                 the merged log claims more in-flight ops than the pipeline can hold",
                 max_commit + 1,
                 new_op,
                 new_op - max_commit,
-                PIPELINE_PREPARE_QUEUE_MAX,
+                self.prepare_queue_max,
             );
             actions.push(VsrAction::RebuildPipeline {
                 from_op: max_commit + 1,
@@ -2458,14 +3560,14 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     /// Caller (`on_ack`) should validate `is_primary` and status before calling.
     ///
     /// # Panics
-    /// - If `header.command` is not `Command2::PrepareOk`.
+    /// - If `header.command` is not `Command::PrepareOk`.
     /// - If `header.replica >= self.replica_count`.
     pub fn handle_prepare_ok(
         &self,
         plane: PlaneKind,
         header: &PrepareOkHeader,
     ) -> PrepareOkOutcome {
-        assert_eq!(header.command, Command2::PrepareOk);
+        assert_eq!(header.command, Command::PrepareOk);
         assert!(
             header.replica < self.replica_count,
             "handle_prepare_ok: invalid replica {}",
@@ -2487,9 +3589,9 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         }
 
         // Ignore if syncing
-        if self.is_syncing() {
+        if self.is_transferring() {
             return PrepareOkOutcome::Ignored {
-                reason: IgnoreReason::Syncing,
+                reason: IgnoreReason::StateTransfer,
             };
         }
 
@@ -2519,7 +3621,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
         // Record the ack from this replica
         let ack_count = entry.add_ack(header.replica);
-        let quorum = self.quorum();
+        let quorum = self.quorum_replication();
         let quorum_reached = ack_count >= quorum && !entry.ok_quorum_received;
 
         // Check if we've reached quorum
@@ -2550,11 +3652,16 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
 
     /// Enqueue a self-addressed message for processing in the next loopback drain.
     ///
-    /// Currently only `PrepareOk` messages are routed here (via `send_or_loopback`).
-    // TODO: Route SVC/DVC self-messages through loopback once VsrAction dispatch is implemented.
+    /// Only `PrepareOk` reaches here (via `send_or_loopback`), and deliberately:
+    /// it is a message to a peer that happens to be this replica, so a one-drain
+    /// delay costs nothing. A replica's own SVC/DVC is not that shape -- it is the
+    /// local decision to change view, recorded synchronously with the view and
+    /// status writes in [`Self::enter_view_change`]. Routing it here instead would
+    /// leave a window where the replica has entered a view change without counting
+    /// itself, which on a solo group is the entire quorum.
     pub(crate) fn push_loopback(&self, message: Message<GenericHeader>) {
         assert!(
-            self.loopback_queue.borrow().len() < PIPELINE_PREPARE_QUEUE_MAX,
+            self.loopback_queue.borrow().len() < self.prepare_queue_max,
             "loopback queue overflow: {} items",
             self.loopback_queue.borrow().len()
         );
@@ -2596,7 +3703,7 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
     }
 }
 
-impl<B, P> Project<Message<PrepareHeader>, VsrConsensus<B, P>> for Message<RequestHeader>
+impl<B, P> Project<Message<PrepareHeader>, VsrConsensus<B, P>> for Message<RoutedRequestHeader>
 where
     B: MessageBus,
     P: Pipeline<Entry = PipelineEntry>,
@@ -2613,13 +3720,57 @@ where
         // `VsrConsensus::next_monotonic_timestamp`.
         let timestamp = consensus.next_monotonic_timestamp();
 
-        self.transmute_header(|old, new| {
+        // Seal the body integrity field over the payload past the 256-byte header
+        // (the client request bytes, carried through the transmute unchanged).
+        // Computed once by the primary and replicated verbatim, so every backup
+        // stores the same value and the scan verifies it after a crash. The body is
+        // never re-stamped (`restamp_prepare_view` patches only `view`), so this
+        // survives view-change retransmits. The header `checksum` and its `parent`
+        // chain are sealed too, for both planes, by `seal_prepare_checksum` below;
+        // they exclude `view`, which is what lets a restamp leave them valid.
+        //
+        // Metadata plane only. A partition produce prepare already carries a verified
+        // `batch_checksum` over the same bytes, so a second full-payload pass is pure
+        // cost on the produce path, and it would describe the WRONG bytes:
+        // `stamp_prepare_for_persistence` rewrites the command header INSIDE this
+        // sealed region before the entry is journaled. Leaving those prepares at `0`
+        // is the designed "nothing to verify" sentinel, so a future durable partition
+        // journal skips verification instead of failing every entry as corrupt.
+        //
+        // TODO(consensus): a partition prepare's `checksum` covers its header alone,
+        // so two at one op with matching header fields are indistinguishable however
+        // far their batch bytes diverge. The merge then counts a divergent replica as
+        // holding a servable copy, and the partition repair ingest (no merged-log
+        // identity gate) short-circuits `verify_prepare_integrity`'s body branch on
+        // the zero. Two closures, both larger than they look:
+        //
+        // 1. The batch checksum, recomputed after `stamp_prepare_for_persistence`.
+        //    But stamping runs per replica after replication and folds `base_offset`
+        //    in, so identity would change at stamp time and the journaled entry would
+        //    no longer match the pipeline entry `handle_prepare_ok` compares.
+        // 2. The stamp-invariant cover: everything past the 256-byte command header,
+        //    which stamping never touches. Identical on every replica, safe to seal
+        //    here, but costs a produce-path pass and retires the "0 means nothing to
+        //    verify" sentinel that lets an existing WAL replay.
+        //
+        // Bounded by `size`, the range every verifier re-reads; the prepare
+        // inherits it verbatim below.
+        let checksum_body = if consensus.group == METADATA_GROUP {
+            u128::from(calculate_checksum(frame_body(
+                self.as_slice(),
+                self.header().size,
+            )))
+        } else {
+            0
+        };
+
+        let prepared = self.transmute_header(|old, new| {
             *new = PrepareHeader {
                 cluster: consensus.cluster,
                 size: old.size,
                 view: consensus.view.get(),
                 release: old.release,
-                command: Command2::Prepare,
+                command: Command::Prepare,
                 replica: consensus.replica,
                 client: old.client,
                 parent: consensus.last_prepare_checksum(),
@@ -2629,14 +3780,24 @@ where
                 op,
                 timestamp,
                 operation: old.operation,
-                namespace: old.namespace,
+                // The GROUP's own id, never the request's: a routed request
+                // header can carry group 0, and journaling that would make
+                // the stored prepare route to the wrong plane when repair
+                // later ships it verbatim (live replication masked this;
+                // repair replay is what broke).
+                group: consensus.group,
+                checksum_body,
                 // Copied verbatim: carries the stamped acting user for client
                 // ops (and the authenticated user on Register), so the in-apply
                 // RBAC gate resolves the same identity on every backup.
                 user_id: old.user_id,
                 ..Default::default()
             }
-        })
+        });
+        // Last, because the checksum covers every other field. Gives the op the
+        // stable identity the view-change merge compares across replicas; `parent`
+        // chains it, so the log is hash-linked rather than nominally so.
+        seal_prepare_checksum(prepared)
     }
 }
 
@@ -2651,7 +3812,7 @@ where
     fn project(self, consensus: &Self::Consensus) -> Message<PrepareOkHeader> {
         self.transmute_header(|old, new| {
             *new = PrepareOkHeader {
-                command: Command2::PrepareOk,
+                command: Command::PrepareOk,
                 parent: old.parent,
                 prepare_checksum: old.checksum,
                 request: old.request,
@@ -2663,12 +3824,13 @@ where
                 commit: consensus.commit_max.get(),
                 timestamp: old.timestamp,
                 operation: old.operation,
-                namespace: old.namespace,
+                group: old.group,
                 // PrepareOk is header-only; the frame is exactly the header, so
                 // `size` is the header size.
                 size: std::mem::size_of::<PrepareOkHeader>() as u32,
                 ..Default::default()
             };
+            new.seal();
         })
     }
 }
@@ -2679,9 +3841,11 @@ where
     P: Pipeline<Entry = PipelineEntry>,
 {
     type MessageBus = B;
-    #[rustfmt::skip] // Scuffed formatter. TODO: Make the naming less ambiguous for `Message`.
-    type Message<H> = Message<H> where H: ConsensusHeader;
-    type RequestHeader = RequestHeader;
+    type Message<H>
+        = server_common::Message<H>
+    where
+        H: ConsensusHeader;
+    type RoutedRequestHeader = RoutedRequestHeader;
     type ReplicateHeader = PrepareHeader;
     type AckHeader = PrepareOkHeader;
 
@@ -2709,31 +3873,30 @@ where
         self.status() == Status::Normal
     }
 
-    fn is_syncing(&self) -> bool {
-        // TODO: for now return false. we have to add syncing related setup to VsrConsensus to make this work.
-        false
+    fn is_transferring(&self) -> bool {
+        self.state_transfer_stage.get() != StateTransferStage::Idle
     }
 }
 
 #[cfg(test)]
 mod request_queue_tests {
     use super::*;
-    use iggy_binary_protocol::{Command2, Operation};
+    use iggy_binary_protocol::{Command, Operation};
 
-    fn make_request(client: u128, request_num: u64) -> Message<RequestHeader> {
-        let header_size = std::mem::size_of::<RequestHeader>();
-        let mut msg = Message::<RequestHeader>::new(header_size);
-        let header = bytemuck::checked::try_from_bytes_mut::<RequestHeader>(
+    fn make_request(client: u128, request_num: u64) -> Message<RoutedRequestHeader> {
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
+        let mut msg = Message::<RoutedRequestHeader>::new(header_size);
+        let header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
             &mut msg.as_mut_slice()[..header_size],
         )
         .expect("zeroed bytes are valid");
-        *header = RequestHeader {
-            command: Command2::Request,
+        *header = RoutedRequestHeader {
+            command: Command::Request,
             client,
             session: 1,
             request: request_num,
             operation: Operation::SendMessages,
-            ..RequestHeader::default()
+            ..RoutedRequestHeader::default()
         };
         msg
     }
@@ -2872,7 +4035,7 @@ mod pipeline_entry_tests {
     //! subscriber `Canceled` even on happy path. Tests pin both halves.
 
     use super::*;
-    use iggy_binary_protocol::{Command2, ReplyHeader};
+    use iggy_binary_protocol::{Command, ReplyHeader};
     use server_common::Message;
 
     fn make_reply(client: u128, request: u64) -> Message<ReplyHeader> {
@@ -2883,7 +4046,7 @@ mod pipeline_entry_tests {
         )
         .expect("zeroed bytes are valid");
         *header = ReplyHeader {
-            command: Command2::Reply,
+            command: Command::Reply,
             client,
             request,
             ..ReplyHeader::default()
@@ -2949,6 +4112,38 @@ mod pipeline_entry_tests {
         let mut entry = PipelineEntry::new(header);
         assert!(entry.take_reply_sender().is_none());
     }
+
+    /// A pipeline configured deeper than [`PIPELINE_PREPARE_QUEUE_MAX`] must
+    /// verify a full queue instead of tripping the capacity assert: the bound
+    /// tracks the configured depth, not the default const.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn given_prepare_queue_depth_above_default_when_verify_should_not_panic() {
+        let depth = PIPELINE_PREPARE_QUEUE_MAX * 2;
+        let mut pipeline = LocalPipeline::with_capacities(depth, depth * 2);
+
+        let mut parent = 0u128;
+        for op in 1..=depth as u64 {
+            let checksum = u128::from(op);
+            let header = PrepareHeader {
+                command: Command::Prepare,
+                size: std::mem::size_of::<PrepareHeader>() as u32,
+                op,
+                parent,
+                checksum,
+                ..Default::default()
+            };
+            pipeline.push(PipelineEntry::new(header));
+            parent = checksum;
+        }
+
+        assert!(
+            pipeline.prepare_queue_full(),
+            "queue filled to the configured depth"
+        );
+        // Would panic on the old `len() <= PIPELINE_PREPARE_QUEUE_MAX` assert.
+        pipeline.verify();
+    }
 }
 
 #[cfg(test)]
@@ -3006,7 +4201,7 @@ mod timestamp_clamp_tests {
             1,
             0,
             1,
-            METADATA_CONSENSUS_NAMESPACE,
+            METADATA_GROUP,
             NoopBus,
             LocalPipeline::new(),
             lagging_clock,
@@ -3038,7 +4233,7 @@ mod timestamp_clamp_tests {
             1,
             0,
             1,
-            METADATA_CONSENSUS_NAMESPACE,
+            METADATA_GROUP,
             NoopBus,
             LocalPipeline::new(),
             leading_clock,
@@ -3050,4 +4245,887 @@ mod timestamp_clamp_tests {
             "a clock ahead of the log must stamp real time, not floor + 1"
         );
     }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn make_start_view(
+        view: u32,
+        op: u64,
+        replica: u8,
+        incarnation: u128,
+    ) -> Message<StartViewHeader> {
+        let size = std::mem::size_of::<StartViewHeader>();
+        let mut msg = Message::<StartViewHeader>::new(size);
+        let header = bytemuck::checked::try_from_bytes_mut::<StartViewHeader>(
+            &mut msg.as_mut_slice()[..size],
+        )
+        .expect("zeroed bytes are a valid StartViewHeader");
+        header.command = Command::StartView;
+        header.cluster = 1;
+        header.view = view;
+        header.op = op;
+        header.commit = op;
+        header.replica = replica;
+        header.incarnation = incarnation;
+        header.group = METADATA_GROUP;
+        header.size = size as u32;
+        msg
+    }
+
+    #[test]
+    fn given_recovering_replica_when_start_view_incarnation_foreign_should_ignore() {
+        // A StartView addressed to a PREVIOUS incarnation, still in flight when the
+        // replica crashed, must be ignored after restart, while the reply echoing
+        // the CURRENT incarnation is adopted. Otherwise the replica could act in a
+        // view it will not remember after another crash.
+        const CURRENT: u128 = 0xB;
+        const STALE: u128 = 0xA;
+
+        // Replica 0 of 3, recovered at view 1 with head op 5, still Recovering
+        // (probing). The primary for view 1 is replica 1 (view % replica_count),
+        // and log_view stays 0 so the equal-view-old-op skip does not fire.
+        let mut consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            3,
+            METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+            ConsensusClock::system(),
+        );
+        consensus.set_incarnation(CURRENT);
+        consensus.set_view(1);
+        consensus.sequencer().set_sequence(5);
+        assert_eq!(consensus.status(), Status::Recovering);
+
+        // Same view, head behind ours, foreign incarnation: ignored.
+        let stale = make_start_view(1, 4, 1, STALE);
+        assert!(
+            consensus
+                .handle_start_view(PlaneKind::Metadata, stale.header(), &[])
+                .is_empty(),
+            "a StartView echoing a previous incarnation must be ignored while recovering"
+        );
+        assert_eq!(
+            consensus.status(),
+            Status::Recovering,
+            "an ignored StartView must not transition status"
+        );
+        assert_eq!(
+            consensus.view(),
+            1,
+            "an ignored StartView must not change the view"
+        );
+
+        // Same view and head but echoing our current incarnation: adopted, since
+        // the match proves the reply post-dates our restart.
+        let fresh = make_start_view(1, 4, 1, CURRENT);
+        assert!(
+            !consensus
+                .handle_start_view(PlaneKind::Metadata, fresh.header(), &[])
+                .is_empty(),
+            "a StartView echoing our current incarnation must be adopted"
+        );
+        assert_eq!(
+            consensus.status(),
+            Status::Normal,
+            "adopting a StartView transitions to Normal"
+        );
+    }
+
+    #[test]
+    fn given_partition_namespace_when_projecting_should_leave_the_body_unsealed() {
+        // The body seal is metadata-only. A partition produce prepare already carries a
+        // verified `batch_checksum` over the same bytes, so a second full-payload hash
+        // is pure cost on the produce path, and it would describe bytes that never reach
+        // the journal: `stamp_prepare_for_persistence` rewrites the command header
+        // inside the sealed region. `0` is the designed "nothing to verify" sentinel, so
+        // a durable partition journal skips verification rather than reading every entry
+        // as corrupt.
+        let seal = |namespace: u64| -> u128 {
+            // Fixed clock: `project` stamps the prepare timestamp, and Miri covers this
+            // crate, where a real clock read is an unsupported syscall.
+            let consensus = VsrConsensus::with_clock(
+                1,
+                0,
+                1,
+                namespace,
+                NoopBus,
+                LocalPipeline::new(),
+                ConsensusClock::new(Rc::new(FixedClock(100_000))),
+            );
+            let header_size = size_of::<RoutedRequestHeader>();
+            let body = b"produce payload";
+            let mut msg = Message::<RoutedRequestHeader>::new(header_size + body.len());
+            msg.as_mut_slice()[header_size..].copy_from_slice(body);
+            let header = bytemuck::checked::try_from_bytes_mut::<RoutedRequestHeader>(
+                &mut msg.as_mut_slice()[..header_size],
+            )
+            .expect("zeroed bytes are a valid RoutedRequestHeader");
+            header.command = Command::Request;
+            header.client = 1;
+            header.request = 1;
+            header.operation = iggy_binary_protocol::Operation::SendMessages;
+            header.size = u32::try_from(header_size + body.len()).expect("fits u32");
+            msg.project(&consensus).header().checksum_body
+        };
+
+        assert_ne!(
+            seal(METADATA_GROUP),
+            0,
+            "a metadata prepare must be sealed: the WAL scan verifies it after a crash"
+        );
+        assert_eq!(
+            seal(1),
+            0,
+            "a partition prepare must be left unsealed, since its sealed region is \
+             rewritten before it is journaled"
+        );
+    }
+
+    #[test]
+    fn given_restored_log_view_when_start_view_head_behind_wal_should_adopt() {
+        // A replica that adopted a StartView at head 105 in view 7, then crashed,
+        // recovers log_view = 7 from the superblock but re-derives head 120 from its
+        // own WAL: adoption drops the head without truncating the journal. The
+        // primary's StartView for view 7 then carries an op BEHIND that head, and
+        // skipping it on the head comparison would leave this replica probing until it
+        // elected instead, carrying a DoViewChange of (7, 120) that outranks the real
+        // primary's (7, 105) and resurrects ops view 7 already discarded.
+        //
+        // Replica 0 of 3 at view 7, whose primary is replica 1 (7 % 3). Incarnation
+        // left at 0 so the recovering-replica guard stays inert and this exercises the
+        // equal-view path alone.
+        let mut consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            3,
+            METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+            ConsensusClock::system(),
+        );
+        consensus.set_view(7);
+        consensus.set_log_view(7);
+        consensus.restore_commit_state(105, 105);
+        consensus.sequencer().set_sequence(120);
+
+        // Below the committed floor: stale by construction, since a live primary's
+        // head covers every op it told us was committed.
+        assert!(
+            consensus
+                .handle_start_view(
+                    PlaneKind::Metadata,
+                    make_start_view(7, 104, 1, 0).header(),
+                    &[]
+                )
+                .is_empty(),
+            "an equal-view StartView below the commit floor must be skipped"
+        );
+        assert_eq!(
+            consensus.sequencer().current_sequence(),
+            120,
+            "a skipped StartView must not move the head"
+        );
+
+        // At the committed floor but behind our WAL head: the primary's real head.
+        // Adopt it and drop the discarded suffix.
+        assert!(
+            !consensus
+                .handle_start_view(
+                    PlaneKind::Metadata,
+                    make_start_view(7, 105, 1, 0).header(),
+                    &[]
+                )
+                .is_empty(),
+            "an equal-view StartView at or above the commit floor must be adopted, \
+             even when its head is behind a WAL suffix the view already discarded"
+        );
+        assert_eq!(
+            consensus.sequencer().current_sequence(),
+            105,
+            "adoption must drop the head to the primary's, so a later DoViewChange \
+             cannot outrank it with a discarded suffix"
+        );
+        assert_eq!(consensus.status(), Status::Normal);
+    }
+
+    /// The split-brain gate's predicate: `view` and `log_view` each independently
+    /// make the superblock stale, and only a matching `mark_superblock_durable`
+    /// clears it. The simulator proves the withheld-send behavior end to end; this
+    /// pins the predicate the dispatch sites and the debug tripwire both read.
+    #[test]
+    fn given_view_change_when_needs_superblock_persist_should_track_durability() {
+        let mut consensus =
+            VsrConsensus::new(1, 0, 3, METADATA_GROUP, NoopBus, LocalPipeline::new());
+        assert!(
+            !consensus.needs_superblock_persist(),
+            "fresh replica: view == view_durable == 0"
+        );
+
+        consensus.set_view(3);
+        assert!(
+            consensus.needs_superblock_persist(),
+            "view advanced but not yet persisted"
+        );
+
+        consensus.mark_superblock_durable(consensus.view(), consensus.log_view());
+        assert!(
+            !consensus.needs_superblock_persist(),
+            "marked durable clears the gate"
+        );
+
+        consensus.set_log_view(3);
+        assert!(
+            consensus.needs_superblock_persist(),
+            "log_view advanced but not yet persisted"
+        );
+
+        consensus.mark_superblock_durable(consensus.view(), consensus.log_view());
+        assert!(!consensus.needs_superblock_persist());
+    }
+}
+
+#[cfg(test)]
+mod vsr_consensus_tests {
+    use super::*;
+
+    #[test]
+    fn stage_transitions_follow_the_machine() {
+        use StateTransferStage::{AwaitingTarget, Fetching, Idle, Installing};
+        let legal = [
+            (Idle, AwaitingTarget),
+            (AwaitingTarget, Fetching),
+            (AwaitingTarget, Idle),
+            (Fetching, Installing),
+            (Fetching, AwaitingTarget),
+            (Fetching, Idle),
+            (Installing, Idle),
+        ];
+        for (from, to) in legal {
+            assert!(
+                StateTransferStage::valid_transition(from, to),
+                "{from:?} -> {to:?} must be legal"
+            );
+        }
+        let illegal = [
+            (Idle, Fetching),
+            (Idle, Installing),
+            (AwaitingTarget, Installing),
+            (Installing, Fetching),
+            (Installing, AwaitingTarget),
+            (Idle, Idle),
+        ];
+        for (from, to) in illegal {
+            assert!(
+                !StateTransferStage::valid_transition(from, to),
+                "{from:?} -> {to:?} must be illegal"
+            );
+        }
+    }
+
+    /// Bus stub: stage plumbing never touches the wire.
+    struct StageNoopBus;
+
+    impl MessageBus for StageNoopBus {
+        async fn send_to_client(
+            &self,
+            _client_id: u128,
+            _data: server_common::iobuf::Frozen<{ server_common::MESSAGE_ALIGN }>,
+        ) -> Result<(), message_bus::SendError> {
+            Ok(())
+        }
+
+        async fn send_to_replica(
+            &self,
+            _replica: u8,
+            _data: server_common::iobuf::Frozen<{ server_common::MESSAGE_ALIGN }>,
+        ) -> Result<(), message_bus::SendError> {
+            Ok(())
+        }
+
+        fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
+        fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
+        fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
+        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
+    }
+
+    #[test]
+    fn is_transferring_tracks_stage() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        assert!(!consensus.is_transferring());
+        consensus.begin_state_transfer_await();
+        assert!(consensus.is_transferring());
+        consensus.set_state_transfer_stage(StateTransferStage::Fetching);
+        consensus.set_state_transfer_stage(StateTransferStage::Installing);
+        assert!(consensus.is_transferring());
+        consensus.set_state_transfer_stage(StateTransferStage::Idle);
+        assert!(!consensus.is_transferring());
+    }
+
+    // A backup left behind on VIEW (partition healed across an election, or a
+    // fresh node that never saw it) keeps getting newer-view heartbeats it
+    // cannot process -- they never reset its heartbeat timer, so the timer
+    // fires. The primary is alive, so it must PROBE to adopt the current view
+    // (which routes into repair / state transfer), not elect: a lagging
+    // replica cannot win, and electing would drag a healthy cluster through a
+    // needless view change.
+    #[test]
+    fn heartbeat_timeout_behind_a_newer_view_probes_not_elects() {
+        // Replica 1 is a backup at view 0 (primary_index(0) == 0).
+        let consensus = VsrConsensus::new(1, 1, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        assert_eq!(consensus.status(), Status::Normal);
+        assert_eq!(consensus.view(), 0);
+
+        // A newer-view frame arrived and was dropped by the ingress path.
+        consensus.observe_newer_view(3);
+
+        let actions = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata);
+
+        assert_eq!(
+            consensus.status(),
+            Status::Recovering,
+            "must enter the probe (Recovering), not an election"
+        );
+        assert_eq!(consensus.view(), 0, "probing must not bump the view");
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::SendStartViewChange { .. })),
+            "must not broadcast an election SVC"
+        );
+    }
+
+    // No newer view seen means the primary is presumed dead, so the timeout
+    // must still elect -- the split must not swallow the ordinary case.
+    #[test]
+    fn heartbeat_timeout_with_no_newer_view_still_elects() {
+        let consensus = VsrConsensus::new(1, 1, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+
+        let actions = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata);
+
+        assert_eq!(
+            consensus.status(),
+            Status::ViewChange,
+            "a silent primary must still trigger an election"
+        );
+        assert_eq!(consensus.view(), 1, "election advances the view");
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::SendStartViewChange { .. })),
+            "election must broadcast its SVC"
+        );
+    }
+
+    // A recorded view at or below the current one is stale (already caught up)
+    // and must not divert a genuine election, since the guard is a strict `>`.
+    #[test]
+    fn stale_observed_view_does_not_divert_election() {
+        let consensus = VsrConsensus::new(1, 1, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.observe_newer_view(0);
+
+        let _ = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata);
+
+        assert_eq!(
+            consensus.status(),
+            Status::ViewChange,
+            "a stale observed view must not suppress the election"
+        );
+    }
+
+    // A fresh or rejoined node that missed an election boots primary-by-index
+    // at a stale view (replica 0 is primary_index(0)). It has no heartbeat
+    // timeout -- it IS the heartbeat sender -- so its heartbeat-SEND timer must
+    // convert to a probe once it observes the newer view, or it wedges forever
+    // advertising a commit point no peer accepts.
+    #[test]
+    fn stale_primary_by_index_probes_on_its_heartbeat_send_timer() {
+        // Replica 0 is primary-by-index at view 0.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        assert!(consensus.is_primary());
+        assert_eq!(consensus.status(), Status::Normal);
+
+        // A prepare/heartbeat from the real primary at a newer view was seen.
+        consensus.observe_newer_view(2);
+
+        let actions = consensus.handle_commit_message_timeout();
+
+        assert_eq!(
+            consensus.status(),
+            Status::Recovering,
+            "a stale primary-by-index must probe, not keep heartbeating"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::SendCommit { .. })),
+            "a stale primary must not advertise a commit point"
+        );
+    }
+
+    // A genuine current primary (no newer view seen) keeps heartbeating.
+    #[test]
+    fn current_primary_keeps_heartbeating() {
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+
+        let actions = consensus.handle_commit_message_timeout();
+
+        assert_eq!(consensus.status(), Status::Normal, "must stay primary");
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, VsrAction::SendCommit { .. })),
+            "a healthy primary must heartbeat"
+        );
+    }
+
+    // `observe_newer_view` is monotone: an older stamp cannot lower it.
+    #[test]
+    fn observe_newer_view_keeps_the_max() {
+        let consensus = VsrConsensus::new(1, 1, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.observe_newer_view(5);
+        consensus.observe_newer_view(2);
+        // Timeout at view 0 with the record still 5 must probe.
+        let _ = consensus.handle_normal_heartbeat_timeout(PlaneKind::Metadata);
+        assert_eq!(consensus.status(), Status::Recovering);
+    }
+
+    /// A prepare as the primary projects one: `parent` is the chain value the
+    /// sequencer stood on before this op, which is exactly what a rollback restores.
+    #[allow(clippy::cast_possible_truncation)]
+    fn projected_prepare(op: u64, parent: u128) -> Message<PrepareHeader> {
+        Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(|_, new| {
+            *new = PrepareHeader {
+                command: Command::Prepare,
+                size: size_of::<PrepareHeader>() as u32,
+                op,
+                parent,
+                ..Default::default()
+            };
+        })
+    }
+
+    /// [`projected_prepare`] carrying the two fields the rollback guards match on,
+    /// so two prepares at the same op stay distinguishable.
+    #[allow(clippy::cast_possible_truncation)]
+    fn projected_prepare_in_view(
+        op: u64,
+        parent: u128,
+        checksum: u128,
+        view: u32,
+    ) -> Message<PrepareHeader> {
+        Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(|_, new| {
+            *new = PrepareHeader {
+                command: Command::Prepare,
+                size: size_of::<PrepareHeader>() as u32,
+                op,
+                parent,
+                checksum,
+                view,
+                ..Default::default()
+            };
+        })
+    }
+
+    /// Pipeline a prepare the way `on_request` does, pre-advancing the sequencer
+    /// and the parent chain ahead of the journal append.
+    fn pipeline(consensus: &VsrConsensus<StageNoopBus>, message: &Message<PrepareHeader>) {
+        consensus.pipeline_message(PlaneKind::Metadata, message);
+    }
+
+    use crate::drain_committable_prefix;
+    use iggy_binary_protocol::Operation;
+
+    /// Clock frozen at a fixed instant, so a stamp read off it is assertable.
+    struct FrozenClock(u64);
+
+    impl clock::Clock for FrozenClock {
+        type Realtime = IggyTimestamp;
+
+        fn realtime(&self) -> Self::Realtime {
+            IggyTimestamp::from(self.0)
+        }
+    }
+
+    /// A client request as the admission path hands it to the request queue.
+    #[allow(clippy::cast_possible_truncation)]
+    fn client_request(client: u128) -> Message<RoutedRequestHeader> {
+        Message::<RoutedRequestHeader>::new(size_of::<RoutedRequestHeader>()).transmute_header(
+            |_, new| {
+                *new = RoutedRequestHeader {
+                    command: Command::Request,
+                    size: size_of::<RoutedRequestHeader>() as u32,
+                    client,
+                    session: 1,
+                    request: 1,
+                    operation: Operation::CreateStream,
+                    ..Default::default()
+                };
+            },
+        )
+    }
+
+    /// Whether the prepare retransmit timer is armed.
+    fn prepare_ticking(consensus: &VsrConsensus<StageNoopBus>) -> bool {
+        consensus.timeouts.borrow().is_ticking(TimeoutKind::Prepare)
+    }
+
+    #[test]
+    fn prepare_timeout_ticks_exactly_while_the_pipeline_is_non_empty() {
+        // The lifecycle invariant: armed by the first push, disarmed the moment
+        // the pipeline drains. Previously it armed at `init` on an empty pipeline
+        // and only disarmed lazily, when the timeout itself fired and found
+        // nothing to retransmit.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        assert!(
+            !prepare_ticking(&consensus),
+            "a fresh primary has nothing to retransmit"
+        );
+
+        let first = projected_prepare(1, 0);
+        pipeline(&consensus, &first);
+        assert!(prepare_ticking(&consensus), "the first push arms the timer");
+
+        let second = projected_prepare(2, 0);
+        pipeline(&consensus, &second);
+
+        // Committing the head leaves op 2 in flight, so the timer stays armed --
+        // now measuring op 2 rather than carrying op 1's elapsed ticks.
+        consensus.advance_commit_max(1);
+        assert_eq!(drain_committable_prefix(&consensus).len(), 1);
+        assert!(
+            prepare_ticking(&consensus),
+            "a remaining prepare keeps the timer armed"
+        );
+
+        consensus.advance_commit_max(2);
+        assert_eq!(drain_committable_prefix(&consensus).len(), 1);
+        assert!(
+            !prepare_ticking(&consensus),
+            "draining the last prepare disarms the timer without waiting for it to fire"
+        );
+    }
+
+    #[test]
+    fn parking_a_request_stamps_its_arrival_from_the_injected_clock() {
+        // The queue wait is `clock_realtime_micros() - received_at` at promotion,
+        // so the stamp has to come from the same injected clock (virtual under
+        // the simulator) and must not consume the prepare-stamping monotonic
+        // sequence.
+        const NOW: u64 = 4_242;
+        let consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            3,
+            0,
+            StageNoopBus,
+            LocalPipeline::new(),
+            ConsensusClock::new(Rc::new(FrozenClock(NOW))),
+        );
+        consensus.init();
+        let before = consensus.next_monotonic_timestamp();
+
+        consensus
+            .push_queued_request(RequestEntry::new(client_request(1)))
+            .expect("empty request queue accepts one");
+
+        let entry = consensus
+            .pop_queued_request()
+            .expect("the just-parked request");
+        assert_eq!(entry.received_at, NOW, "stamped from the injected clock");
+        assert_eq!(
+            consensus.next_monotonic_timestamp(),
+            before + 1,
+            "parking must not consume the prepare-stamping monotonic sequence"
+        );
+    }
+
+    #[test]
+    fn clearing_the_pipeline_disarms_the_prepare_timeout() {
+        // A view change re-prepares from the new primary, so nothing left here is
+        // worth retransmitting.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        pipeline(&consensus, &projected_prepare(1, 0));
+        assert!(prepare_ticking(&consensus));
+
+        consensus.clear_pipeline();
+        assert!(consensus.pipeline_is_empty());
+        assert!(!prepare_ticking(&consensus));
+    }
+
+    #[test]
+    fn rollback_hands_back_the_op_a_failed_append_claimed() {
+        // Without this, the sequencer keeps claiming op 8 while the WAL stops at 7:
+        // the next request projects op 9 over a hole that no repair path refills.
+        const PARENT: u128 = 0xfeed;
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.sequencer().set_sequence(7);
+        consensus.set_last_prepare_checksum(PARENT);
+
+        let message = projected_prepare(8, PARENT);
+        pipeline(&consensus, &message);
+        assert_eq!(consensus.sequencer().current_sequence(), 8);
+
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(message.header()),
+            PrepareRollback::Unwound
+        );
+        assert_eq!(consensus.sequencer().current_sequence(), 7);
+        assert_eq!(consensus.last_prepare_checksum(), PARENT);
+        assert!(
+            consensus.pipeline_is_empty(),
+            "the reclaimed op must not stay live in the pipeline; the next request reuses it"
+        );
+    }
+
+    #[test]
+    fn rollback_is_refused_once_a_sibling_took_the_next_op() {
+        // The race the pre-advance exists for: a request pipelined while op 8's
+        // append was in flight already chained op 9 off it. Rewinding would hand
+        // op 9's number back out while op 9 is still live, so the refusal is the
+        // safe answer and the caller escalates.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.sequencer().set_sequence(7);
+
+        let first = projected_prepare(8, 0);
+        pipeline(&consensus, &first);
+        let sibling = projected_prepare(9, 0);
+        pipeline(&consensus, &sibling);
+
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(first.header()),
+            PrepareRollback::Overtaken { sequence: 9 }
+        );
+        assert_eq!(consensus.sequencer().current_sequence(), 9);
+        assert_eq!(
+            consensus.pipeline_len(),
+            2,
+            "a refused rollback must not touch the pipeline"
+        );
+    }
+
+    #[test]
+    fn rollback_is_refused_while_a_view_change_is_running() {
+        // A view change can conclude under the append's `.await`, after which every
+        // number the rollback reads belongs to the new view, including a sequencer
+        // back on this op with a different prepare beneath it. Unwinding there pops a
+        // live entry and rewinds beneath an op peers have journaled.
+        const PARENT: u128 = 0xfeed;
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.sequencer().set_sequence(7);
+        consensus.set_last_prepare_checksum(PARENT);
+
+        let message = projected_prepare_in_view(8, PARENT, 0xaaaa, 0);
+        pipeline(&consensus, &message);
+        assert_eq!(consensus.sequencer().current_sequence(), 8);
+
+        let _ = consensus.enter_view_change(
+            PlaneKind::Metadata,
+            3,
+            ViewChangeReason::NormalHeartbeatTimeout,
+        );
+
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(message.header()),
+            PrepareRollback::Superseded { view: 3 },
+            "a prepare from a view this replica has left owns none of this state"
+        );
+        assert_eq!(
+            consensus.sequencer().current_sequence(),
+            8,
+            "a refused rollback must not move the sequencer"
+        );
+        assert_eq!(
+            consensus.last_prepare_checksum(),
+            0xaaaa,
+            "a refused rollback must not rewind the parent chain"
+        );
+    }
+
+    #[test]
+    fn rollback_is_refused_when_the_tail_is_a_different_prepare() {
+        // Op numbers repeat across views: a rewind to the merged head lets the next
+        // request re-project this number with its own checksum. Matching on `op` alone
+        // pops that live entry, and the old `debug_assert` let release rewind anyway.
+        const PARENT: u128 = 0xfeed;
+        const LIVE: u128 = 0xbbbb;
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.sequencer().set_sequence(7);
+
+        // The op-8 entry that is actually live, projected after the rewind.
+        let live = projected_prepare_in_view(8, PARENT, LIVE, 0);
+        pipeline(&consensus, &live);
+
+        // The op-8 prepare whose append failed: same number, different bytes.
+        let failed = projected_prepare_in_view(8, PARENT, 0xaaaa, 0);
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(failed.header()),
+            PrepareRollback::TailMismatch
+        );
+        assert_eq!(consensus.sequencer().current_sequence(), 8);
+        assert_eq!(consensus.last_prepare_checksum(), LIVE);
+        assert_eq!(
+            consensus.pipeline_len(),
+            1,
+            "the live entry must survive a refused rollback"
+        );
+        assert!(
+            consensus.pipeline_holds_entry(8, LIVE),
+            "and it must still be the same entry"
+        );
+    }
+
+    #[test]
+    fn rollback_disarms_the_prepare_timeout_when_it_empties_the_pipeline() {
+        // `Unwound` pops through the pipeline directly, so it owes the same
+        // "ticking iff non-empty" maintenance every other drain does.
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.sequencer().set_sequence(7);
+
+        let message = projected_prepare(8, 0);
+        pipeline(&consensus, &message);
+        assert!(prepare_ticking(&consensus));
+
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(message.header()),
+            PrepareRollback::Unwound
+        );
+        assert!(consensus.pipeline_is_empty());
+        assert!(
+            !prepare_ticking(&consensus),
+            "unwinding the sole in-flight prepare leaves nothing to retransmit"
+        );
+    }
+
+    #[test]
+    fn rollback_finds_nothing_to_undo_on_a_backup() {
+        // Replica 1 is a backup at view 0, and a backup advances only after its
+        // append succeeds, so a failed append left nothing pre-advanced.
+        let consensus = VsrConsensus::new(1, 1, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.sequencer().set_sequence(7);
+
+        let message = projected_prepare(8, 0);
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(message.header()),
+            PrepareRollback::NotPreAdvanced
+        );
+        assert_eq!(consensus.sequencer().current_sequence(), 7);
+    }
+
+    #[test]
+    fn rollback_cancels_the_client_awaiting_the_dropped_prepare() {
+        // The write was never made durable, so the caller must learn it failed
+        // instead of parking until its request times out.
+        use futures::FutureExt as _;
+
+        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        consensus.init();
+        consensus.sequencer().set_sequence(7);
+
+        let message = projected_prepare(8, 0);
+        let receiver = consensus.pipeline_message_with_subscriber(PlaneKind::Metadata, &message);
+
+        assert_eq!(
+            consensus.rollback_pipelined_prepare(message.header()),
+            PrepareRollback::Unwound
+        );
+        assert!(
+            matches!(receiver.now_or_never(), Some(Err(crate::oneshot::Canceled))),
+            "dropping the entry must cancel its awaiter"
+        );
+    }
+}
+
+#[cfg(test)]
+mod quorum_tests {
+    //! Pin the three quorum sizes for replica counts 1 through 8. The
+    //! intersection asserts are the safety properties: replication and
+    //! view-change quorums must overlap, so a committed op is visible to the
+    //! next view, and replication and nack quorums must overlap, so an op that
+    //! may have committed can never gather a nack quorum.
+
+    use super::*;
+    use crate::LocalPipeline;
+    use server_common::MESSAGE_ALIGN;
+    use server_common::iobuf::Frozen;
+
+    struct NoopBus;
+
+    impl MessageBus for NoopBus {
+        async fn send_to_client(
+            &self,
+            _client_id: u128,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), message_bus::SendError> {
+            Ok(())
+        }
+
+        async fn send_to_replica(
+            &self,
+            _replica: u8,
+            _data: Frozen<MESSAGE_ALIGN>,
+        ) -> Result<(), message_bus::SendError> {
+            Ok(())
+        }
+
+        fn set_connection_lost_fn(&self, _f: message_bus::ConnectionLostFn) {}
+        fn set_replica_forward_fn(&self, _f: message_bus::ReplicaForwardFn) {}
+        fn set_client_forward_fn(&self, _f: message_bus::ClientForwardFn) {}
+        fn track_background(&self, _handle: message_bus::JoinHandle<()>) {}
+    }
+
+    fn consensus_with_replica_count(replica_count: u8) -> VsrConsensus<NoopBus, LocalPipeline> {
+        VsrConsensus::new(
+            1,
+            0,
+            replica_count,
+            METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        )
+    }
+
+    #[test]
+    fn given_any_replica_count_when_sizing_quorums_should_intersect() {
+        for replica_count in 1u8..=REPLICAS_MAX_U8 {
+            let consensus = consensus_with_replica_count(replica_count);
+            let count = usize::from(replica_count);
+
+            assert!(
+                consensus.quorum_replication() + consensus.quorum_view_change() > count,
+                "replication+view-change must intersect at replica_count={replica_count}"
+            );
+            assert!(
+                consensus.quorum_nack_prepare() + consensus.quorum_replication() > count,
+                "nack+replication must intersect at replica_count={replica_count}"
+            );
+            assert!(consensus.quorum_replication() <= count);
+            assert!(consensus.quorum_view_change() <= count);
+            assert!(consensus.quorum_nack_prepare() <= count);
+        }
+    }
+
+    /// `REPLICAS_MAX` as a `u8` for loop bounds.
+    const REPLICAS_MAX_U8: u8 = {
+        assert!(REPLICAS_MAX <= u8::MAX as usize);
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            REPLICAS_MAX as u8
+        }
+    };
 }

@@ -54,16 +54,21 @@
 //! trusted L2 boundary (cluster-local VPC, dedicated private subnet,
 //! encrypted overlay such as `WireGuard`, or an air-gapped management
 //! network).
-//
-// TODO(hubcio): follow-up - dual-key rotation acceptance window.
+//!
+//! Rotating the PSK is NOT a coordinated-restart change: a verify-only
+//! acceptance window for the retiring key
+//! (`cluster.auth.previous_shared_secret`) lets a rolling three-step
+//! rotation keep every mid-roll handshake verifiable; see the
+//! [`ReplicaAuth`] rustdoc for the procedure.
 
 use crate::framing;
 use crate::replica::auth::{self, ChannelBinding, HandshakeStatus, ReplicaAuth, Transcript};
 use crate::{GenericHeader, Message};
 use compio::io::{AsyncRead, AsyncWrite};
-use iggy_binary_protocol::{Command2, HEADER_SIZE};
+use iggy_binary_protocol::{Command, HEADER_SIZE};
 use iggy_common::IggyError;
 use rustls::pki_types::ServerName;
+use std::collections::HashMap;
 use std::mem::size_of;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -90,9 +95,11 @@ pub struct ReplicaHandshakeCtx {
 /// `server` drives the acceptor (TLS server) role on a delegated inbound
 /// connection; `client` drives the dialer role on a delegated outbound
 /// one. `peer_names` maps a replica id to the name the dialer presents
-/// in SNI and verifies the peer's certificate against; in self-signed
-/// mode the client config's verifier accepts any certificate and only
-/// the PSK handshake authenticates the peer, so the name only feeds SNI.
+/// in SNI and verifies the peer's certificate against; keyed explicitly
+/// by id (not roster position) so sparse ids from dynamic replica join
+/// cannot verify against another peer's name. In self-signed mode the
+/// client config's verifier accepts any certificate and only the PSK
+/// handshake authenticates the peer, so the name only feeds SNI.
 ///
 /// Both configs are TLS 1.3 only with the `iggy-replica` ALPN
 /// ([`crate::transports::tls::REPLICA_ALPN`]); a client-plane TLS
@@ -101,8 +108,8 @@ pub struct ReplicaHandshakeCtx {
 pub struct ReplicaTlsCtx {
     pub server: Arc<rustls::ServerConfig>,
     pub client: Arc<rustls::ClientConfig>,
-    /// Indexed by replica id; same length as the roster.
-    pub peer_names: Vec<ServerName<'static>>,
+    /// Keyed by replica id; one entry per roster node.
+    pub peer_names: HashMap<u8, ServerName<'static>>,
 }
 
 /// Run the acceptor half on a delegated inbound stream and return the
@@ -147,7 +154,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     // fd without reading, so a reject frame would land in its VSR reader instead.
     let nackable = auth.is_some() && has_nonce;
 
-    if header.command != Command2::ReplicaHello {
+    if header.command != Command::ReplicaHello {
         return reject(
             stream,
             our_cluster,
@@ -231,7 +238,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     // reject here is log-only (no frame).
     // Check the command before the MAC: the finish frame is identified by its
     // own discriminant, not by handshake position.
-    if finish.header().command != Command2::ReplicaFinish {
+    if finish.header().command != Command::ReplicaFinish {
         return reject(
             stream,
             our_cluster,
@@ -313,7 +320,7 @@ pub async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
             return Err(());
         }
     };
-    if challenge.header().command != Command2::ReplicaChallenge {
+    if challenge.header().command != Command::ReplicaChallenge {
         warn!(
             replica = peer_id,
             command = ?challenge.header().command,
@@ -408,7 +415,7 @@ fn build_challenge_message(
     #[allow(clippy::cast_possible_truncation)]
     Message::<GenericHeader>::new(size_of::<GenericHeader>()).transmute_header(
         |_, h: &mut GenericHeader| {
-            h.command = Command2::ReplicaChallenge;
+            h.command = Command::ReplicaChallenge;
             h.cluster = cluster_id;
             h.replica = replica_id;
             h.size = HEADER_SIZE as u32;
@@ -434,7 +441,7 @@ fn build_hello_message(
     #[allow(clippy::cast_possible_truncation)]
     Message::<GenericHeader>::new(size_of::<GenericHeader>()).transmute_header(
         |_, h: &mut GenericHeader| {
-            h.command = Command2::ReplicaHello;
+            h.command = Command::ReplicaHello;
             h.cluster = cluster_id;
             h.replica = replica_id;
             h.size = HEADER_SIZE as u32;
@@ -455,7 +462,7 @@ fn build_finish_message(
     #[allow(clippy::cast_possible_truncation)]
     Message::<GenericHeader>::new(size_of::<GenericHeader>()).transmute_header(
         |_, h: &mut GenericHeader| {
-            h.command = Command2::ReplicaFinish;
+            h.command = Command::ReplicaFinish;
             h.cluster = cluster_id;
             h.replica = replica_id;
             h.size = HEADER_SIZE as u32;

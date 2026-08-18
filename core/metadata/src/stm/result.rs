@@ -146,10 +146,15 @@ macro_rules! result_enum {
 }
 
 // Streams.
-result_enum!(CreateStreamResult { NameAlreadyExists = 1012 });
+result_enum!(CreateStreamResult {
+    NameAlreadyExists = 1012,
+    TooManyStreams = 1020,
+    InvalidOptionValue = 4042,
+});
 result_enum!(UpdateStreamResult {
     StreamNotFound = 1009,
     NameAlreadyExists = 1012,
+    InvalidOptionValue = 4042,
 });
 result_enum!(DeleteStreamResult { StreamNotFound = 1009 });
 result_enum!(PurgeStreamResult { StreamNotFound = 1009 });
@@ -158,11 +163,16 @@ result_enum!(PurgeStreamResult { StreamNotFound = 1009 });
 result_enum!(CreateTopicResult {
     StreamNotFound = 1009,
     NameAlreadyExists = 2013,
+    InvalidPartitionsCount = 2019,
+    TooManyTopics = 2021,
+    PartitionIdSpaceExhausted = 3013,
+    InvalidOptionValue = 4042,
 });
 result_enum!(UpdateTopicResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
     NameAlreadyExists = 2013,
+    InvalidOptionValue = 4042,
 });
 result_enum!(DeleteTopicResult {
     StreamNotFound = 1009,
@@ -173,16 +183,20 @@ result_enum!(PurgeTopicResult {
     TopicNotFound = 2010,
 });
 
-// Partitions. `InvalidPartitionsCount` also covers the partition-id overflow
-// guards in the apply handler.
+// `InvalidPartitionsCount` covers the `u32` overflow guards and non-distinct
+// ids. `PartitionIdSpaceExhausted` covers the packed-layout ceiling. Neither is
+// `TooManyPartitions`, which dispatch owns for an oversized single request: the
+// split is by REMEDY (smaller batch vs delete partitions), not by terminality.
 result_enum!(CreatePartitionsResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
     InvalidPartitionsCount = 2019,
+    PartitionIdSpaceExhausted = 3013,
 });
 result_enum!(DeletePartitionsResult {
     StreamNotFound = 1009,
     TopicNotFound = 2010,
+    InvalidPartitionsCount = 2019,
 });
 // `TruncatePartition` is the committed form of a client `DeleteSegments`; an
 // unresolvable target commits as a rejection so the request sequence stays
@@ -198,11 +212,13 @@ result_enum!(TruncatePartitionResult {
 result_enum!(CreateUserResult {
     InvalidUsername = 43,
     UserAlreadyExists = 46,
+    InvalidOptionValue = 4042,
 });
 result_enum!(UpdateUserResult {
     UserNotFound = 20,
     InvalidUsername = 43,
     UsernameAlreadyExists = 46,
+    InvalidOptionValue = 4042,
 });
 result_enum!(DeleteUserResult {
     UserNotFound = 20,
@@ -230,7 +246,30 @@ result_enum!(CreateConsumerGroupResult {
     TopicNotFound = 2010,
     NameAlreadyExists = 5004,
 });
-result_enum!(DeleteConsumerGroupResult { NotFound = 5000 });
+// Delete/Join/Leave resolve stream -> topic -> group inside the apply (the
+// authz gate passes a resolution miss through), so their codes mirror the
+// legacy `resolve_consumer_group` ladder -- StreamIdNotFound / TopicIdNotFound
+// / ConsumerGroupIdNotFound. One divergence: when the caller is unauthorized
+// AND the group is missing, legacy resolves first and leaks the miss (5000)
+// while ng commits Unauthorized (41) without confirming existence. Leave also
+// mirrors legacy's post-resolution member check: leaving a group the client
+// never joined returns ConsumerGroupMemberNotFound.
+result_enum!(DeleteConsumerGroupResult {
+    StreamNotFound = 1009,
+    TopicNotFound = 2010,
+    ConsumerGroupNotFound = 5000,
+});
+result_enum!(JoinConsumerGroupResult {
+    StreamNotFound = 1009,
+    TopicNotFound = 2010,
+    ConsumerGroupNotFound = 5000,
+});
+result_enum!(LeaveConsumerGroupResult {
+    StreamNotFound = 1009,
+    TopicNotFound = 2010,
+    ConsumerGroupNotFound = 5000,
+    ConsumerGroupMemberNotFound = 5006,
+});
 
 /// `IggyError::Unauthorized`. Any control-plane op can commit as an in-apply
 /// authorization no-op, so this code is valid for every op regardless of its
@@ -282,6 +321,8 @@ pub const fn result_code_recognized(operation: Operation, code: u32) -> bool {
         }
         Operation::CreateConsumerGroup => CreateConsumerGroupResult::from_u32(code).is_some(),
         Operation::DeleteConsumerGroup => DeleteConsumerGroupResult::from_u32(code).is_some(),
+        Operation::JoinConsumerGroup => JoinConsumerGroupResult::from_u32(code).is_some(),
+        Operation::LeaveConsumerGroup => LeaveConsumerGroupResult::from_u32(code).is_some(),
         _ => true,
     }
 }
@@ -480,6 +521,10 @@ mod tests {
             u32::from(CreatePartitionsResult::InvalidPartitionsCount),
             IggyError::InvalidPartitionsCount.as_code(),
         );
+        assert_eq!(
+            u32::from(CreateTopicResult::InvalidPartitionsCount),
+            IggyError::InvalidPartitionsCount.as_code(),
+        );
 
         // UserAlreadyExists (46) - also stands in for username-already-exists.
         let user_exists = IggyError::UserAlreadyExists.as_code();
@@ -561,9 +606,75 @@ mod tests {
             u32::from(CreateConsumerGroupResult::NameAlreadyExists),
             IggyError::ConsumerGroupNameAlreadyExists(String::new(), id()).as_code(),
         );
+        let consumer_group_not_found = IggyError::ConsumerGroupIdNotFound(id(), id()).as_code();
+
+        // Delete/Join/Leave mirror the legacy `resolve_consumer_group` error
+        // ladder.
         assert_eq!(
-            u32::from(DeleteConsumerGroupResult::NotFound),
-            IggyError::ConsumerGroupIdNotFound(id(), id()).as_code(),
+            u32::from(DeleteConsumerGroupResult::StreamNotFound),
+            stream_not_found
+        );
+        assert_eq!(
+            u32::from(DeleteConsumerGroupResult::TopicNotFound),
+            topic_not_found
+        );
+        assert_eq!(
+            u32::from(DeleteConsumerGroupResult::ConsumerGroupNotFound),
+            consumer_group_not_found,
+        );
+        assert_eq!(
+            u32::from(JoinConsumerGroupResult::StreamNotFound),
+            stream_not_found
+        );
+        assert_eq!(
+            u32::from(JoinConsumerGroupResult::TopicNotFound),
+            topic_not_found
+        );
+        assert_eq!(
+            u32::from(JoinConsumerGroupResult::ConsumerGroupNotFound),
+            consumer_group_not_found,
+        );
+        assert_eq!(
+            u32::from(LeaveConsumerGroupResult::StreamNotFound),
+            stream_not_found
+        );
+        assert_eq!(
+            u32::from(LeaveConsumerGroupResult::TopicNotFound),
+            topic_not_found
+        );
+        assert_eq!(
+            u32::from(LeaveConsumerGroupResult::ConsumerGroupNotFound),
+            consumer_group_not_found,
+        );
+        assert_eq!(
+            u32::from(LeaveConsumerGroupResult::ConsumerGroupMemberNotFound),
+            IggyError::ConsumerGroupMemberNotFound(0, id(), id()).as_code(),
+        );
+
+        // Namespace ceilings. 1020 and 2021 sit above gaps left by retired
+        // variants that shipped SDK tables still map, so a renumber here is the
+        // drift this test exists to catch.
+        assert_eq!(
+            u32::from(CreateStreamResult::TooManyStreams),
+            IggyError::TooManyStreams.as_code(),
+        );
+        assert_eq!(
+            u32::from(CreateTopicResult::TooManyTopics),
+            IggyError::TooManyTopics.as_code(),
+        );
+        let partition_id_space_exhausted = IggyError::PartitionIdSpaceExhausted.as_code();
+        assert_eq!(
+            u32::from(CreateTopicResult::PartitionIdSpaceExhausted),
+            partition_id_space_exhausted,
+        );
+        assert_eq!(
+            u32::from(CreatePartitionsResult::PartitionIdSpaceExhausted),
+            partition_id_space_exhausted,
+        );
+        // The per-topic ceiling must not collapse onto dispatch's per-request cap.
+        assert_ne!(
+            partition_id_space_exhausted,
+            IggyError::TooManyPartitions.as_code(),
         );
 
         // Unauthorized (41) - the global in-apply RBAC denial code.

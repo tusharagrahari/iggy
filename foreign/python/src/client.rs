@@ -17,7 +17,8 @@
 
 use bytes::Bytes;
 use iggy::prelude::{
-    Consumer as RustConsumer, IggyClient as RustIggyClient, IggyMessage as RustMessage,
+    AutoCommit as RustAutoCommit, Consumer as RustConsumer, IggyClient as RustIggyClient,
+    IggyExpiry as RustIggyExpiry, IggyMessage as RustMessage, MaxTopicSize as RustMaxTopicSize,
     PollingStrategy as RustPollingStrategy, *,
 };
 use pyo3::PyRef;
@@ -26,50 +27,103 @@ use pyo3::types::{PyBytes, PyDelta, PyList, PyType};
 use pyo3_async_runtimes::tokio::future_into_py;
 use pyo3_stub_gen::define_stub_info_gatherer;
 use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::config::PyClientConfig;
 use crate::consumer::{
     AutoCommit, ConsumerGroup as PyConsumerGroup, ConsumerGroupDetails as PyConsumerGroupDetails,
-    IggyConsumer, py_delta_to_iggy_duration,
+    IggyConsumer,
 };
+use crate::duration::{py_delta_to_iggy_duration, reject_zero};
 use crate::identifier::PyIdentifier;
+use crate::options::OptionSpec as PyOptionSpec;
+use crate::permissions::Permissions as PyPermissions;
 use crate::receive_message::{PollingStrategy, ReceiveMessage};
-use crate::send_message::SendMessage;
+use crate::send_message::{SendMessage, SendMessagesResponse as PySendMessagesResponse};
 use crate::stream::StreamDetails;
-use crate::topic::{Topic, TopicDetails};
+use crate::topic::{IggyExpiry, MaxTopicSize, Topic, TopicDetails};
 use crate::user::{
     UserInfo as PyUserInfo, UserInfoDetails as PyUserInfoDetails, UserStatus as PyUserStatus,
 };
 use tokio::sync::Mutex;
 
 /// A Python class representing the Iggy client.
-/// It wraps the RustIggyClient and provides asynchronous functionality
-/// through the contained runtime.
+/// It provides asynchronous functionality through the contained runtime.
 #[gen_stub_pyclass]
 #[pyclass]
 pub struct IggyClient {
     inner: Arc<RustIggyClient>,
 }
 
+/// Resolves the shared `create_topic`/`update_topic` parameters, applying
+/// server defaults where the caller left them unset.
+fn resolve_topic_params(
+    compression_algorithm: Option<String>,
+    message_expiry: Option<&IggyExpiry>,
+    max_topic_size: Option<&MaxTopicSize>,
+) -> PyResult<(CompressionAlgorithm, RustIggyExpiry, RustMaxTopicSize)> {
+    let compression_algorithm = match compression_algorithm {
+        Some(algo) => CompressionAlgorithm::from_str(&algo)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?,
+        None => CompressionAlgorithm::default(),
+    };
+
+    let expiry = message_expiry
+        .map(RustIggyExpiry::try_from)
+        .transpose()?
+        .unwrap_or(RustIggyExpiry::ServerDefault);
+
+    let max_size = max_topic_size
+        .map(RustMaxTopicSize::try_from)
+        .transpose()?
+        .unwrap_or(RustMaxTopicSize::ServerDefault);
+
+    Ok((compression_algorithm, expiry, max_size))
+}
+
 #[gen_stub_pymethods]
 #[pymethods]
 impl IggyClient {
-    /// Constructs a new IggyClient from a TCP server address.
+    /// Constructs a new IggyClient from a TCP server address or a `TcpConfig`.
     /// This initializes a new runtime for asynchronous operations.
     /// Future versions might utilize asyncio for more Pythonic async.
+    ///
+    /// Args:
+    ///     conn: Either a `host:port` address, or a `TcpConfig` carrying the full
+    ///         transport configuration. Defaults to `127.0.0.1:8090` with auto-login
+    ///         disabled. A malformed address is reported differently by the two
+    ///         forms: the string form raises `RuntimeError` here, while `TcpConfig`
+    ///         raises `ValueError` when it is constructed, before it ever reaches
+    ///         this call. Neither exception is a subclass of the other.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the address passed as a string is not a valid
+    ///         `host:port` pair.
     #[new]
     #[pyo3(signature = (conn=None))]
     fn new(
-        #[gen_stub(override_type(type_repr = "builtins.str | None"))] conn: Option<String>,
+        #[gen_stub(override_type(type_repr = "TcpConfig | builtins.str | None"))] conn: Option<
+            PyClientConfig,
+        >,
     ) -> PyResult<Self> {
-        let client = IggyClientBuilder::new()
-            .with_tcp()
-            .with_server_address(conn.unwrap_or("127.0.0.1:8090".to_string()))
-            .build()
+        let config = match conn {
+            Some(PyClientConfig::Config(config)) => config.client_config(),
+            Some(PyClientConfig::ServerAddress(server_address)) => Arc::new(
+                TcpClientConfigBuilder::new()
+                    .with_server_address(server_address)
+                    .build()
+                    .map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string())
+                    })?,
+            ),
+            None => Arc::new(TcpClientConfig::default()),
+        };
+        let tcp_client = TcpClient::create(config)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         Ok(IggyClient {
-            inner: Arc::new(client),
+            inner: Arc::new(RustIggyClient::new(ClientWrapper::Tcp(tcp_client))),
         })
     }
 
@@ -91,8 +145,7 @@ impl IggyClient {
     }
 
     /// Sends a ping request to the server to check connectivity.
-    /// Returns `Ok(())` if the server responds successfully, or a `PyRuntimeError`
-    /// if the connection fails.
+    /// Raises `RuntimeError` if the connection fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn ping<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
@@ -104,8 +157,41 @@ impl IggyClient {
         })
     }
 
+    /// Describe the option catalog for a resource scope.
+    ///
+    /// This is the discovery surface for the `options` argument on
+    /// `create_topic`/`update_topic`: a key outside the catalog is refused at
+    /// create, and the binary transports carry only the error code back.
+    ///
+    /// Args:
+    ///     scope: One of `"topic"`, `"stream"`, `"user"`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `list[OptionSpec]`, empty for a scope
+    ///     with no keys yet.
+    ///
+    /// Raises:
+    ///     ValueError: If the scope name is not one of the three above.
+    ///     RuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[OptionSpec]]", imports=("collections.abc")))]
+    fn describe_options<'a>(&self, py: Python<'a>, scope: &str) -> PyResult<Bound<'a, PyAny>> {
+        let scope = crate::options::options_scope_from_str(scope)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            let specs = inner
+                .describe_options(scope)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(specs
+                .into_iter()
+                .map(PyOptionSpec::from)
+                .collect::<Vec<_>>())
+        })
+    }
+
     /// Logs in the user with the given credentials.
-    /// Returns `Ok(())` on success, or a PyRuntimeError on failure.
+    /// Raises `RuntimeError` on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn login_user<'a>(
         &self,
@@ -133,8 +219,8 @@ impl IggyClient {
     ///     or `None` otherwise.
     ///
     /// Raises:
-    ///     PyValueError: If a string identifier is invalid.
-    ///     PyRuntimeError: If the request fails.
+    ///     ValueError: If a string identifier is invalid.
+    ///     RuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[UserInfoDetails | None]", imports=("collections.abc")))]
     fn get_user<'a>(&self, py: Python<'a>, user_id: PyIdentifier) -> PyResult<Bound<'a, PyAny>> {
         let user_id = Identifier::try_from(user_id)?;
@@ -155,7 +241,7 @@ impl IggyClient {
     ///     An awaitable that resolves to `list[UserInfo]`.
     ///
     /// Raises:
-    ///     PyRuntimeError: If the request fails.
+    ///     RuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[UserInfo]]", imports=("collections.abc")))]
     fn get_users<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
@@ -171,19 +257,18 @@ impl IggyClient {
 
     /// Create a new user.
     ///
-    /// The user is created without permissions.
-    ///
     /// Args:
     ///     username: Username as `str`.
     ///     password: Password as `str`.
     ///     status: User status as `UserStatus | None`; defaults to `UserStatus.Active`.
+    ///     permissions: Permissions as `Permissions | None`; the user has none when `None`.
     ///
     /// Returns:
     ///     An awaitable that resolves to the created `UserInfoDetails`.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an argument is invalid or the request fails.
-    #[pyo3(signature = (username, password, status=None))]
+    ///     RuntimeError: If an argument is invalid or the request fails.
+    #[pyo3(signature = (username, password, status=None, permissions=None))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[UserInfoDetails]", imports=("collections.abc")))]
     fn create_user<'a>(
         &self,
@@ -191,13 +276,17 @@ impl IggyClient {
         username: String,
         password: String,
         #[gen_stub(override_type(type_repr = "UserStatus | None"))] status: Option<PyUserStatus>,
+        #[gen_stub(override_type(type_repr = "Permissions | None"))] permissions: Option<
+            PyPermissions,
+        >,
     ) -> PyResult<Bound<'a, PyAny>> {
         let status = status.map_or(UserStatus::Active, UserStatus::from);
+        let permissions = permissions.map(|permissions| permissions.inner);
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
             let user = inner
-                .create_user(&username, &password, status, None)
+                .create_user(&username, &password, status, permissions)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(PyUserInfoDetails::from(user))
@@ -215,8 +304,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `None` when the user is updated.
     ///
     /// Raises:
-    ///     PyValueError: If a string identifier is invalid.
-    ///     PyRuntimeError: If the request fails.
+    ///     ValueError: If a string identifier is invalid.
+    ///     RuntimeError: If the request fails.
     #[pyo3(signature = (user_id, username=None, status=None))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn update_user<'a>(
@@ -232,7 +321,13 @@ impl IggyClient {
 
         future_into_py(py, async move {
             inner
-                .update_user(&user_id, username.as_deref(), status)
+                .update_user(
+                    &user_id,
+                    username.as_deref(),
+                    status,
+                    // Users have no option keys yet.
+                    &UserUpdateOptions::default(),
+                )
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
@@ -248,8 +343,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `None` when the user is deleted.
     ///
     /// Raises:
-    ///     PyValueError: If a string identifier is invalid.
-    ///     PyRuntimeError: If the request fails.
+    ///     ValueError: If a string identifier is invalid.
+    ///     RuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn delete_user<'a>(&self, py: Python<'a>, user_id: PyIdentifier) -> PyResult<Bound<'a, PyAny>> {
         let user_id = Identifier::try_from(user_id)?;
@@ -264,8 +359,99 @@ impl IggyClient {
         })
     }
 
+    /// Update the permissions of a user by unique ID or username.
+    ///
+    /// This is a full replacement: the given permissions overwrite the previous
+    /// ones, and `None` removes them entirely.
+    ///
+    /// Args:
+    ///     user_id: User identifier as `str | int`.
+    ///     permissions: New permissions as `Permissions | None`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the permissions are updated.
+    ///
+    /// Raises:
+    ///     ValueError: If a string identifier is invalid.
+    ///     RuntimeError: If the request fails.
+    #[pyo3(signature = (user_id, permissions))]
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn update_permissions<'a>(
+        &self,
+        py: Python<'a>,
+        user_id: PyIdentifier,
+        #[gen_stub(override_type(type_repr = "Permissions | None"))] permissions: Option<
+            PyPermissions,
+        >,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let user_id = Identifier::try_from(user_id)?;
+        let permissions = permissions.map(|permissions| permissions.inner);
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .update_permissions(&user_id, permissions)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Change the password of a user by unique ID or username.
+    ///
+    /// Args:
+    ///     user_id: User identifier as `str | int`.
+    ///     current_password: Current password as `str`.
+    ///     new_password: New password as `str`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the password is changed.
+    ///
+    /// Raises:
+    ///     ValueError: If a string identifier is invalid.
+    ///     RuntimeError: If the current password is wrong or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn change_password<'a>(
+        &self,
+        py: Python<'a>,
+        user_id: PyIdentifier,
+        current_password: String,
+        new_password: String,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        let user_id = Identifier::try_from(user_id)?;
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .change_password(&user_id, &current_password, &new_password)
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    /// Log out the currently authenticated user.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the user is logged out.
+    ///
+    /// Raises:
+    ///     RuntimeError: If the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn logout_user<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+
+        future_into_py(py, async move {
+            inner
+                .logout_user()
+                .await
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     /// Connects the IggyClient to its service.
-    /// Returns Ok(()) on successful connection or a PyRuntimeError on failure.
+    /// Raises `RuntimeError` if the connection fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn connect<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
@@ -279,7 +465,7 @@ impl IggyClient {
     }
 
     /// Creates a new stream with the provided ID and name.
-    /// Returns Ok(()) on successful stream creation or a PyRuntimeError on failure.
+    /// Raises `RuntimeError` if the stream cannot be created.
     #[pyo3(signature = (name))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn create_stream<'a>(&self, py: Python<'a>, name: String) -> PyResult<Bound<'a, PyAny>> {
@@ -294,7 +480,8 @@ impl IggyClient {
     }
 
     /// Gets stream by id.
-    /// Returns Option of stream details or a PyRuntimeError on failure.
+    /// Returns the stream details, or `None` if the stream does not exist.
+    /// Raises `RuntimeError` on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[StreamDetails | None]", imports=("collections.abc")))]
     fn get_stream<'a>(
         &self,
@@ -314,9 +501,33 @@ impl IggyClient {
     }
 
     /// Creates a new topic with the given parameters.
-    /// Returns Ok(()) on successful topic creation or a PyRuntimeError on failure.
+    ///
+    /// Args:
+    ///     stream: Stream identifier as `str | int`.
+    ///     name: Topic name as `str`.
+    ///     partitions_count: Number of partitions as `int`.
+    ///     compression_algorithm: Compression algorithm as `str | None`.
+    ///     message_expiry: Message expiry as `IggyExpiry | None`.
+    ///     max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+    ///     segment_size: Per-topic segment size in bytes as `int | None`.
+    ///     enforce_fsync: Per-topic fsync enforcement as `bool | None`.
+    ///     messages_required_to_save: Message-count flush threshold as `int | None`.
+    ///     size_of_messages_required_to_save: Byte flush threshold as `int | None`.
+    ///     preallocate_segments: Reserve segment bytes on open as `bool | None`.
+    ///     options: Additional option keys as `dict[str, str] | None`, sent
+    ///         verbatim so a newer server key can be set from this build.
+    ///
+    /// Every option left as `None` resolves against the server default at
+    /// admission.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` when the topic is created.
+    ///
+    /// Raises:
+    ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
+    ///     PyRuntimeError: If another argument is invalid or the request fails.
     #[pyo3(
-        signature = (stream, name, partitions_count, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
+        signature = (stream, name, partitions_count, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, enforce_fsync = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, options = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -329,40 +540,50 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "builtins.str | None"))] compression_algorithm: Option<
             String,
         >,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))] replication_factor: Option<
-            u8,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] message_expiry: Option<
+            &IggyExpiry,
         >,
-        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
-        message_expiry: Option<Py<PyDelta>>,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_topic_size: Option<u64>,
+        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] max_topic_size: Option<
+            &MaxTopicSize,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] segment_size: Option<u64>,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] enforce_fsync: Option<bool>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
+        messages_required_to_save: Option<u32>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))]
+        size_of_messages_required_to_save: Option<u64>,
+        #[gen_stub(override_type(type_repr = "builtins.bool | None"))] preallocate_segments: Option<
+            bool,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.dict[builtins.str, builtins.str] | None"))]
+        options: Option<BTreeMap<String, String>>,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let compression_algorithm = match compression_algorithm {
-            Some(algo) => CompressionAlgorithm::from_str(&algo)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?,
-            None => CompressionAlgorithm::default(),
-        };
+        let (compression_algorithm, expiry, max_size) =
+            resolve_topic_params(compression_algorithm, message_expiry, max_topic_size)?;
 
-        let expiry = match message_expiry {
-            Some(delta) => IggyExpiry::ExpireDuration(py_delta_to_iggy_duration(&delta)),
-            None => IggyExpiry::ServerDefault,
+        let topic_options = TopicCreateOptions {
+            partitions_count: Some(partitions_count),
+            // `None` is what tells admission to resolve the server default, so
+            // the sentinels the resolver returns must collapse back to it.
+            compression_algorithm: (compression_algorithm != CompressionAlgorithm::default())
+                .then_some(compression_algorithm),
+            message_expiry: (expiry != RustIggyExpiry::ServerDefault).then_some(expiry),
+            max_topic_size: (max_size != RustMaxTopicSize::ServerDefault).then_some(max_size),
+            segment_size: segment_size.map(IggyByteSize::from),
+            enforce_fsync,
+            messages_required_to_save,
+            size_of_messages_required_to_save: size_of_messages_required_to_save
+                .map(IggyByteSize::from),
+            preallocate_segments,
+            raw: options.unwrap_or_default(),
         };
-
-        let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
 
         let stream = Identifier::try_from(stream)?;
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
             inner
-                .create_topic(
-                    &stream,
-                    &name,
-                    partitions_count,
-                    compression_algorithm,
-                    replication_factor,
-                    expiry,
-                    max_size,
-                )
+                .create_topic(&stream, &name, &topic_options)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
@@ -370,7 +591,8 @@ impl IggyClient {
     }
 
     /// Gets topic by stream and id.
-    /// Returns Option of topic details or a PyRuntimeError on failure.
+    /// Returns the topic details, or `None` if the topic does not exist.
+    /// Raises `RuntimeError` on failure.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[TopicDetails | None]", imports=("collections.abc")))]
     fn get_topic<'a>(
         &self,
@@ -400,7 +622,7 @@ impl IggyClient {
     ///     An awaitable that resolves to `list[Topic]`.
     ///
     /// Raises:
-    ///     PyRuntimeError: If the identifier is invalid or the request fails.
+    ///     RuntimeError: If the identifier is invalid or the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[Topic]]", imports=("collections.abc")))]
     fn get_topics<'a>(
         &self,
@@ -421,25 +643,29 @@ impl IggyClient {
 
     /// Update an existing topic.
     ///
-    /// This is a full replacement: any optional parameter left unset is reset to
-    /// its server default rather than preserved.
+    /// A patch, not a replacement: every setting rides the options block, so a
+    /// field left unset keeps the topic's current value rather than resetting
+    /// it to a server default.
     ///
     /// Args:
     ///     stream_id: Stream identifier as `str | int`.
     ///     topic_id: Topic identifier as `str | int`.
     ///     name: New topic name as `str`.
     ///     compression_algorithm: Compression algorithm as `str | None`.
-    ///     replication_factor: Replication factor as `int | None`.
-    ///     message_expiry: Message expiry as `datetime.timedelta | None`.
-    ///     max_topic_size: Maximum topic size in bytes as `int | None`.
+    ///     message_expiry: Message expiry as `IggyExpiry | None`.
+    ///     max_topic_size: Maximum topic size as `MaxTopicSize | None`.
+    ///     options: Additional option keys as `dict[str, str] | None`, sent
+    ///         verbatim so an updatable server key can be set from this build.
+    ///         A create-only key is refused by name.
     ///
     /// Returns:
     ///     An awaitable that resolves to `None` when the topic is updated.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an argument is invalid or the request fails.
+    ///     ValueError: If `message_expiry` or `max_topic_size` is out of range.
+    ///     PyRuntimeError: If another argument is invalid or the request fails.
     #[pyo3(
-        signature = (stream_id, topic_id, name, compression_algorithm = None, replication_factor = None, message_expiry = None, max_topic_size = None)
+        signature = (stream_id, topic_id, name, compression_algorithm = None, message_expiry = None, max_topic_size = None, options = None)
     )]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
@@ -452,25 +678,29 @@ impl IggyClient {
         #[gen_stub(override_type(type_repr = "builtins.str | None"))] compression_algorithm: Option<
             String,
         >,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))] replication_factor: Option<
-            u8,
+        #[gen_stub(override_type(type_repr = "IggyExpiry | None"))] message_expiry: Option<
+            &IggyExpiry,
         >,
-        #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
-        message_expiry: Option<Py<PyDelta>>,
-        #[gen_stub(override_type(type_repr = "builtins.int | None"))] max_topic_size: Option<u64>,
+        #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] max_topic_size: Option<
+            &MaxTopicSize,
+        >,
+        #[gen_stub(override_type(type_repr = "builtins.dict[builtins.str, builtins.str] | None"))]
+        options: Option<BTreeMap<String, String>>,
     ) -> PyResult<Bound<'a, PyAny>> {
-        let compression_algorithm = match compression_algorithm {
-            Some(algo) => CompressionAlgorithm::from_str(&algo)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?,
-            None => CompressionAlgorithm::default(),
+        // Absent stays absent: a key the caller did not pass is left alone
+        // server-side rather than reset to a default.
+        let compression_algorithm = compression_algorithm
+            .map(|algo| {
+                CompressionAlgorithm::from_str(&algo)
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))
+            })
+            .transpose()?;
+        let update_options = TopicUpdateOptions {
+            compression_algorithm,
+            message_expiry: message_expiry.map(RustIggyExpiry::try_from).transpose()?,
+            max_topic_size: max_topic_size.map(RustMaxTopicSize::try_from).transpose()?,
+            raw: options.unwrap_or_default(),
         };
-
-        let expiry = match message_expiry {
-            Some(delta) => IggyExpiry::ExpireDuration(py_delta_to_iggy_duration(&delta)),
-            None => IggyExpiry::ServerDefault,
-        };
-
-        let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
 
         let stream_id = Identifier::try_from(stream_id)?;
         let topic_id = Identifier::try_from(topic_id)?;
@@ -478,15 +708,7 @@ impl IggyClient {
 
         future_into_py(py, async move {
             inner
-                .update_topic(
-                    &stream_id,
-                    &topic_id,
-                    &name,
-                    compression_algorithm,
-                    replication_factor,
-                    expiry,
-                    max_size,
-                )
+                .update_topic(&stream_id, &topic_id, &name, &update_options)
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
             Ok(())
@@ -503,7 +725,7 @@ impl IggyClient {
     ///     An awaitable that resolves to `None` when the topic is deleted.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an identifier is invalid or the request fails.
+    ///     RuntimeError: If an identifier is invalid or the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn delete_topic<'a>(
         &self,
@@ -534,7 +756,7 @@ impl IggyClient {
     ///     An awaitable that resolves to `None` when the topic is purged.
     ///
     /// Raises:
-    ///     PyRuntimeError: If an identifier is invalid or the request fails.
+    ///     RuntimeError: If an identifier is invalid or the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn purge_topic<'a>(
         &self,
@@ -566,8 +788,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `None` when the consumer group is created.
     ///
     /// Raises:
-    ///     PyValueError: If an identifier is invalid.
-    ///     PyRuntimeError: If the request fails.
+    ///     ValueError: If an identifier is invalid.
+    ///     RuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn create_consumer_group<'a>(
         &self,
@@ -601,8 +823,8 @@ impl IggyClient {
     ///     or `None` otherwise.
     ///
     /// Raises:
-    ///     PyValueError: If an identifier is invalid.
-    ///     PyRuntimeError: If the request fails.
+    ///     ValueError: If an identifier is invalid.
+    ///     RuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[ConsumerGroupDetails | None]", imports=("collections.abc")))]
     fn get_consumer_group<'a>(
         &self,
@@ -635,8 +857,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `list[ConsumerGroup]`.
     ///
     /// Raises:
-    ///     PyValueError: If an identifier is invalid.
-    ///     PyRuntimeError: If the request fails.
+    ///     ValueError: If an identifier is invalid.
+    ///     RuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[ConsumerGroup]]", imports=("collections.abc")))]
     fn get_consumer_groups<'a>(
         &self,
@@ -671,8 +893,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `None` when the consumer group is deleted.
     ///
     /// Raises:
-    ///     PyValueError: If a string identifier is invalid.
-    ///     PyRuntimeError: If the request fails.
+    ///     ValueError: If a string identifier is invalid.
+    ///     RuntimeError: If the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn delete_consumer_group<'a>(
         &self,
@@ -709,8 +931,8 @@ impl IggyClient {
     ///     An awaitable that resolves to `None` when the client joins the consumer group.
     ///
     /// Raises:
-    ///     PyValueError: If a string identifier is invalid.
-    ///     PyRuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
+    ///     ValueError: If a string identifier is invalid.
+    ///     RuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn join_consumer_group<'a>(
         &self,
@@ -749,8 +971,8 @@ impl IggyClient {
     ///     rejoin on their next poll.
     ///
     /// Raises:
-    ///     PyValueError: If a string identifier is invalid.
-    ///     PyRuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
+    ///     ValueError: If a string identifier is invalid.
+    ///     RuntimeError: If the request fails, including `Feature is unavailable` on HTTP transport.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
     fn leave_consumer_group<'a>(
         &self,
@@ -774,8 +996,11 @@ impl IggyClient {
     }
 
     /// Sends a list of messages to the specified topic.
-    /// Returns Ok(()) on successful sending or a PyRuntimeError on failure.
-    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    /// Returns a SendMessagesResponse carrying the per-partition commit
+    /// confirmations, or a PyRuntimeError on failure. The confirmation list is
+    /// empty when the server reports no offsets, and the legacy server never
+    /// reports any.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[SendMessagesResponse]", imports=("collections.abc")))]
     fn send_messages<'a>(
         &self,
         py: Python<'a>,
@@ -802,16 +1027,16 @@ impl IggyClient {
         let inner = self.inner.clone();
 
         future_into_py(py, async move {
-            inner
+            let response = inner
                 .send_messages(&stream, &topic, &partitioning, messages.as_mut())
                 .await
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-            Ok(())
+            Ok(PySendMessagesResponse::from(response))
         })
     }
 
     /// Polls for messages from the specified topic and partition.
-    /// Returns a list of received messages or a PyRuntimeError on failure.
+    /// Returns a list of received messages or a RuntimeError on failure.
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[ReceiveMessage]]", imports=("collections.abc")))]
     fn poll_messages<'a>(
@@ -857,7 +1082,10 @@ impl IggyClient {
     }
 
     /// Creates a new consumer group consumer.
-    /// Returns the consumer or a PyRuntimeError on failure.
+    /// Returns the consumer or a RuntimeError on failure. Raises `ValueError` if
+    /// `poll_interval`, `polling_retry_interval`, `init_retry_interval` or an
+    /// `AutoCommit` interval is negative, or if any of those except `poll_interval`
+    /// is zero.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         name,
@@ -925,16 +1153,18 @@ impl IggyClient {
             builder = builder.batch_length(batch_length)
         };
         if let Some(auto_commit) = auto_commit {
-            builder = builder.auto_commit(auto_commit.into())
+            builder = builder.auto_commit(RustAutoCommit::try_from(auto_commit)?)
         };
         if let Some(poll_interval) = poll_interval {
-            builder = builder.poll_interval(py_delta_to_iggy_duration(&poll_interval))
+            builder = builder.poll_interval(py_delta_to_iggy_duration(&poll_interval)?)
         } else {
             builder = builder.without_poll_interval()
         };
         if let Some(polling_retry_interval) = polling_retry_interval {
-            builder =
-                builder.polling_retry_interval(py_delta_to_iggy_duration(&polling_retry_interval))
+            builder = builder.polling_retry_interval(reject_zero(
+                py_delta_to_iggy_duration(&polling_retry_interval)?,
+                "polling_retry_interval",
+            )?)
         }
         if init_retries.is_some() && init_retry_interval.is_none() {
             return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
@@ -950,7 +1180,10 @@ impl IggyClient {
         {
             builder = builder.init_retries(
                 init_retries,
-                py_delta_to_iggy_duration(&init_retry_interval),
+                reject_zero(
+                    py_delta_to_iggy_duration(&init_retry_interval)?,
+                    "init_retry_interval",
+                )?,
             );
         }
         if allow_replay {
@@ -982,7 +1215,7 @@ impl IggyClient {
     ///     An awaitable that resolves to the raw response `bytes`.
     ///
     /// Raises:
-    ///     PyRuntimeError: If the command cannot be sent or the server returns an error.
+    ///     RuntimeError: If the command cannot be sent or the server returns an error.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[bytes]", imports=("collections.abc")))]
     fn send_binary_request<'a>(
         &self,
